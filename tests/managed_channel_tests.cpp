@@ -9,16 +9,20 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include <cerrno>
+#include <fcntl.h>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -26,12 +30,12 @@ namespace {
 
 using namespace std::chrono_literals;
 
-#define CHECK(condition)                                                                         \
-    do {                                                                                         \
-        if (!(condition)) {                                                                      \
-            throw std::runtime_error(std::string("check failed: ") + #condition + " at " +     \
-                                     __FILE__ + ":" + std::to_string(__LINE__));                 \
-        }                                                                                        \
+#define CHECK(condition)                                                                     \
+    do {                                                                                     \
+        if (!(condition)) {                                                                  \
+            throw std::runtime_error(std::string("check failed: ") + #condition + " at " + \
+                                     __FILE__ + ":" + std::to_string(__LINE__));             \
+        }                                                                                    \
     } while (false)
 
 [[nodiscard]] std::string unique_name(std::string_view suffix) {
@@ -78,18 +82,6 @@ private:
     shmchan::managed_channel_options options;
     options.message_capacity = 16;
     options.max_message_size = 256;
-    options.heartbeat_interval = 10ms;
-    options.participant_timeout = 250ms;
-    options.reservation_timeout = 500ms;
-    options.acknowledgment_timeout = 80ms;
-    return options;
-}
-
-[[nodiscard]] shmchan::managed_open_options open_options(
-    shmchan::protocol_descriptor protocol = {
-        shmchan::protocol_id("shmchan.raw-bytes"), 1}) {
-    shmchan::managed_open_options options;
-    options.protocol = protocol;
     return options;
 }
 
@@ -97,23 +89,16 @@ private:
     return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
 }
 
-template <typename Predicate>
-[[nodiscard]] bool wait_until(Predicate&& predicate, std::chrono::milliseconds timeout) {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (predicate()) {
-            return true;
-        }
-        std::this_thread::sleep_for(5ms);
-    }
-    return predicate();
+[[nodiscard]] std::string as_string(
+    const shmchan::managed_byte_channel::buffer_type& bytes) {
+    return as_string(std::span<const std::byte>{bytes.data(), bytes.size()});
 }
 
 void write_ready_byte(int descriptor) {
     const char value = '1';
     ssize_t result = 0;
     do {
-        result = ::write(descriptor, &value, sizeof(value));
+        result = ::write(descriptor, std::addressof(value), sizeof(value));
     } while (result < 0 && errno == EINTR);
     if (result != static_cast<ssize_t>(sizeof(value))) {
         throw std::system_error(errno, std::generic_category(), "write readiness byte");
@@ -124,370 +109,193 @@ void read_ready_byte(int descriptor) {
     char value = 0;
     ssize_t result = 0;
     do {
-        result = ::read(descriptor, &value, sizeof(value));
+        result = ::read(descriptor, std::addressof(value), sizeof(value));
     } while (result < 0 && errno == EINTR);
     if (result != static_cast<ssize_t>(sizeof(value)) || value != '1') {
         throw std::runtime_error("failed to read child readiness byte");
     }
 }
 
-void write_status_code(int descriptor, shmchan::channel_status status) {
-    const auto value = static_cast<std::uint32_t>(status);
-    const auto* bytes = reinterpret_cast<const char*>(std::addressof(value));
-    std::size_t written = 0;
-    while (written < sizeof(value)) {
-        const auto result = ::write(descriptor, bytes + written, sizeof(value) - written);
-        if (result < 0 && errno == EINTR) {
-            continue;
-        }
-        if (result <= 0) {
-            throw std::system_error(errno, std::generic_category(), "write status code");
-        }
-        written += static_cast<std::size_t>(result);
-    }
-}
-
-[[nodiscard]] shmchan::channel_status read_status_code(int descriptor) {
-    std::uint32_t value = 0;
-    auto* bytes = reinterpret_cast<char*>(std::addressof(value));
-    std::size_t received = 0;
-    while (received < sizeof(value)) {
-        const auto result = ::read(descriptor, bytes + received, sizeof(value) - received);
-        if (result < 0 && errno == EINTR) {
-            continue;
-        }
-        if (result <= 0) {
-            throw std::runtime_error("failed to read status code");
-        }
-        received += static_cast<std::size_t>(result);
-    }
-    return static_cast<shmchan::channel_status>(value);
-}
-
 void check_child_killed(pid_t child, int signal_number) {
     int status = 0;
-    CHECK(::waitpid(child, &status, 0) == child);
+    CHECK(::waitpid(child, std::addressof(status), 0) == child);
     CHECK(WIFSIGNALED(status));
     CHECK(WTERMSIG(status) == signal_number);
 }
 
 void check_child_exited(pid_t child, int expected) {
     int status = 0;
-    CHECK(::waitpid(child, &status, 0) == child);
+    CHECK(::waitpid(child, std::addressof(status), 0) == child);
     CHECK(WIFEXITED(status));
     CHECK(WEXITSTATUS(status) == expected);
 }
 
-void test_basic_ack_close_and_metrics() {
+void test_basic_variable_messages_and_close() {
     const auto name = unique_name("basic");
     unlink_guard cleanup(name);
     auto options = test_options();
-    options.message_capacity = 4;
+    options.message_capacity = 3;
     options.max_message_size = 32;
-    options.role = shmchan::participant_role::producer;
-    auto sender = shmchan::managed_byte_channel::create(name, options);
+    auto channel = shmchan::managed_byte_channel::create(name, options);
+    auto peer = shmchan::managed_byte_channel::open(name);
 
-    auto receiver_options = open_options();
-    receiver_options.role = shmchan::participant_role::consumer;
-    auto receiver = shmchan::managed_byte_channel::open(name, receiver_options);
-
-    CHECK(sender.name() == "/" + name);
-    CHECK(sender.capacity() == 4);
-    CHECK(sender.max_message_size() == 32);
-    CHECK(sender.generation() == 1);
-    CHECK(sender.state() == shmchan::managed_channel_state::healthy);
-    CHECK(receiver.try_receive().code == shmchan::channel_status::would_block);
-    CHECK(sender.try_send(std::string(33, 'x')) ==
+    CHECK(channel.name() == "/" + name);
+    CHECK(channel.capacity() == 3);
+    CHECK(channel.max_message_size() == 32);
+    CHECK(channel.state() == shmchan::managed_channel_state::healthy);
+    CHECK(peer.try_receive().code == shmchan::channel_status::would_block);
+    CHECK(channel.try_send(std::string(33, 'x')) ==
           shmchan::channel_status::message_too_large);
 
-    CHECK(sender.send("hello", 101) == shmchan::channel_status::success);
-    CHECK(sender.try_send("duplicate", 101) ==
-          shmchan::channel_status::duplicate_message);
-    auto delivery = receiver.receive_for(1s);
-    CHECK(delivery);
-    CHECK(delivery->message_id() == 101);
-    CHECK(delivery->generation() == 1);
-    CHECK(delivery->attempt() == 1);
-    CHECK(!delivery->redelivered());
-    CHECK(!delivery->is_loaned());
-    CHECK(as_string(delivery->bytes()) == "hello");
+    CHECK(channel.send("a") == shmchan::channel_status::success);
+    CHECK(channel.send("a much longer message") ==
+          shmchan::channel_status::success);
+    CHECK(channel.send(std::string_view{}) == shmchan::channel_status::success);
+    CHECK(channel.try_send("full") == shmchan::channel_status::would_block);
 
-    const auto before_ack = sender.stats();
-    CHECK(before_ack.sent_messages == 1);
-    CHECK(before_ack.delivered_messages == 1);
-    CHECK(before_ack.inflight_messages == 1);
-    CHECK(before_ack.active_participants == 2);
-    CHECK(delivery->ack() == shmchan::channel_status::success);
-    CHECK(delivery->ack() == shmchan::channel_status::stale_delivery);
+    auto first = peer.receive_for(1s);
+    CHECK(first);
+    CHECK(as_string(*first) == "a");
 
-    const auto after_ack = sender.stats();
-    CHECK(after_ack.acknowledged_messages == 1);
-    CHECK(after_ack.free_slots == 4);
-    const auto participants = sender.participants();
-    CHECK(participants.size() == 2);
-    CHECK(participants[0].observed_generation == 1);
+    auto second = peer.receive_for(1s);
+    CHECK(second);
+    CHECK(as_string(*second) == "a much longer message");
 
-    CHECK(sender.close());
-    CHECK(!receiver.close());
-    CHECK(sender.try_send("closed") == shmchan::channel_status::closed);
-    CHECK(receiver.receive_for(100ms).code == shmchan::channel_status::closed);
+    auto third = peer.receive_for(1s);
+    CHECK(third);
+    CHECK(third->empty());
+
+    const auto stats = channel.stats();
+    CHECK(stats.sent_messages == 3);
+    CHECK(stats.received_messages == 3);
+    CHECK(stats.free_slots == 3);
+    CHECK(stats.ready_messages == 0);
+
+    CHECK(channel.send("drain-before-close") ==
+          shmchan::channel_status::success);
+    CHECK(channel.close());
+    CHECK(!peer.close());
+    CHECK(channel.send("closed") == shmchan::channel_status::closed);
+    auto draining = peer.receive_for(1s);
+    CHECK(draining);
+    CHECK(as_string(*draining) == "drain-before-close");
+    CHECK(peer.receive_for(100ms).code == shmchan::channel_status::closed);
 }
 
-void test_zero_copy_nack_timeout_and_reservation_cleanup() {
-    const auto name = unique_name("zero-copy");
+void test_timeouts_and_slot_reuse() {
+    const auto name = unique_name("timeouts");
     unlink_guard cleanup(name);
     auto options = test_options();
-    options.message_capacity = 3;
-    options.max_message_size = 64;
-    options.acknowledgment_timeout = 40ms;
+    options.message_capacity = 2;
     auto channel = shmchan::managed_byte_channel::create(name, options);
 
-    auto reservation = channel.try_reserve(201);
-    CHECK(reservation);
-    CHECK(reservation->capacity() == 64);
-    const std::string zero_copy_message = "written directly into shared memory";
-    std::memcpy(
-        reservation->buffer().data(), zero_copy_message.data(), zero_copy_message.size());
-    CHECK(reservation->commit(zero_copy_message.size()) == shmchan::channel_status::success);
+    CHECK(channel.receive_for(20ms).code == shmchan::channel_status::timed_out);
+    CHECK(channel.send("one") == shmchan::channel_status::success);
+    CHECK(channel.send("two") == shmchan::channel_status::success);
+    CHECK(channel.send_for("three", 20ms) ==
+          shmchan::channel_status::timed_out);
 
-    auto first = channel.receive_loaned_for(1s);
-    CHECK(first);
-    CHECK(first->is_loaned());
-    CHECK(as_string(first->bytes()) == zero_copy_message);
-    CHECK(first->nack() == shmchan::channel_status::success);
+    auto one = channel.receive_for(1s);
+    CHECK(one && as_string(*one) == "one");
+    CHECK(channel.send("slot-reused-after-receive") ==
+          shmchan::channel_status::success);
 
-    auto after_nack = channel.receive_loaned_for(1s);
-    CHECK(after_nack);
-    CHECK(after_nack->attempt() == 2);
-    CHECK(after_nack->redelivered());
-    CHECK(after_nack->ack() == shmchan::channel_status::success);
+    auto two = channel.receive_for(1s);
+    auto reused = channel.receive_for(1s);
+    CHECK(two && as_string(*two) == "two");
+    CHECK(reused && as_string(*reused) == "slot-reused-after-receive");
 
-    CHECK(channel.send("lease", 202) == shmchan::channel_status::success);
-    {
-        auto unacknowledged = channel.receive_for(1s);
-        CHECK(unacknowledged);
-        CHECK(unacknowledged->attempt() == 1);
-    }
-    auto after_timeout = channel.receive_for(1s);
-    CHECK(after_timeout);
-    CHECK(after_timeout->message_id() == 202);
-    CHECK(after_timeout->attempt() == 2);
-    CHECK(after_timeout->ack() == shmchan::channel_status::success);
-
-    {
-        auto cancelled = channel.try_reserve(203);
-        CHECK(cancelled);
-    }
-    auto stats = channel.stats();
-    CHECK(stats.negatively_acknowledged_messages == 1);
-    CHECK(stats.redelivered_messages >= 1);
-    CHECK(stats.cancelled_reservations == 1);
-    CHECK(stats.free_slots == 3);
-
-    const std::array<std::string, 2> batch_payloads{"batch-a", "batch-b"};
-    const std::array<shmchan::outbound_message, 2> batch{{
-        {
-            std::as_bytes(std::span<const char>{
-                batch_payloads[0].data(), batch_payloads[0].size()}),
-            205,
-        },
-        {
-            std::as_bytes(std::span<const char>{
-                batch_payloads[1].data(), batch_payloads[1].size()}),
-            206,
-        },
-    }};
-    const auto batch_result = channel.try_send_batch(batch);
-    CHECK(batch_result.code == shmchan::channel_status::success);
-    CHECK(batch_result.sent == 2);
-    auto deliveries = channel.try_receive_batch(2);
-    CHECK(deliveries.size() == 2);
-    CHECK(as_string(deliveries[0].bytes()) == "batch-a");
-    CHECK(as_string(deliveries[1].bytes()) == "batch-b");
-    CHECK(deliveries[0].ack() == shmchan::channel_status::success);
-    CHECK(deliveries[1].ack() == shmchan::channel_status::success);
-
-    CHECK(channel.send(std::string_view{}, 207) == shmchan::channel_status::success);
-    auto empty = channel.receive_for(1s);
-    CHECK(empty);
-    CHECK(empty->bytes().empty());
-    CHECK(empty->ack() == shmchan::channel_status::success);
-
-    auto pending = channel.try_reserve(204);
-    CHECK(pending);
-    CHECK(channel.close());
-    CHECK(pending->commit(0) == shmchan::channel_status::closed);
-    CHECK(channel.receive_for(200ms).code == shmchan::channel_status::closed);
-    CHECK(channel.stats().cancelled_reservations == 2);
+    const auto stats = channel.stats();
+    CHECK(stats.send_timeouts == 1);
+    CHECK(stats.receive_timeouts == 1);
 }
 
-void test_protocol_and_participant_validation() {
+void test_protocol_and_open_or_create() {
     const auto name = unique_name("protocol");
     unlink_guard cleanup(name);
     auto options = test_options();
     options.protocol = {shmchan::protocol_id("example.document"), 7};
-    options.max_participants = 1;
-    auto only = shmchan::managed_byte_channel::create(name, options);
+    auto first = shmchan::managed_byte_channel::open_or_create(name, options);
+    auto second = shmchan::managed_byte_channel::open_or_create(name, options);
+    CHECK(first.protocol() == options.protocol);
+    CHECK(second.capacity() == options.message_capacity);
 
-    bool participant_limit_detected = false;
+    bool mismatch_detected = false;
     try {
-        auto extra = shmchan::managed_byte_channel::open(name, open_options(options.protocol));
-        (void)extra;
-    } catch (const shmchan::managed_channel_error& error) {
-        participant_limit_detected = error.code() == shmchan::channel_status::participant_limit;
-    }
-    CHECK(participant_limit_detected);
-
-    bool protocol_mismatch_detected = false;
-    try {
-        const shmchan::protocol_descriptor wrong{
-            shmchan::protocol_id("example.document"), 8};
-        auto incompatible = shmchan::managed_byte_channel::open(name, open_options(wrong));
+        shmchan::managed_open_options wrong;
+        wrong.protocol = {shmchan::protocol_id("example.document"), 8};
+        auto incompatible = shmchan::managed_byte_channel::open(name, wrong);
         (void)incompatible;
     } catch (const shmchan::managed_channel_error& error) {
-        protocol_mismatch_detected =
+        mismatch_detected =
             error.code() == shmchan::channel_status::protocol_mismatch;
     }
-    CHECK(protocol_mismatch_detected);
+    CHECK(mismatch_detected);
 
-    only = shmchan::managed_byte_channel{};
-    auto reopened = shmchan::managed_byte_channel::open(name, open_options(options.protocol));
-    CHECK(reopened.protocol() == options.protocol);
-}
-
-void test_unlink_fences_live_handles_and_wakes_waiters() {
-    const auto name = unique_name("unlink");
-    unlink_guard cleanup(name);
-    auto channel = shmchan::managed_byte_channel::create(name, test_options());
-    std::atomic<shmchan::channel_status> receive_status{shmchan::channel_status::success};
-    std::thread waiter([&] {
-        receive_status.store(channel.receive().code, std::memory_order_release);
-    });
-    std::this_thread::sleep_for(20ms);
-    CHECK(shmchan::managed_byte_channel::unlink(name));
-    waiter.join();
-    CHECK(receive_status.load(std::memory_order_acquire) ==
-          shmchan::channel_status::broken);
-    CHECK(channel.try_send("after-unlink") == shmchan::channel_status::broken);
-    CHECK(!shmchan::managed_byte_channel::unlink(name));
-}
-
-void test_generation_rebuild_and_replay() {
-    const auto name = unique_name("generation");
-    unlink_guard cleanup(name);
-    auto options = test_options();
-    options.message_capacity = 4;
-    auto supervisor = shmchan::managed_byte_channel::create(name, options);
-    auto peer = shmchan::managed_byte_channel::open(name);
-
-    CHECK(supervisor.send("lost-old-generation", 301) ==
-          shmchan::channel_status::success);
-    auto old_reservation = peer.try_reserve(302);
-    CHECK(old_reservation);
-    CHECK(supervisor.mark_broken());
-    CHECK(peer.try_send("blocked") == shmchan::channel_status::broken);
-
-    const auto rebuilt = supervisor.rebuild_with_replay(
-        [&](shmchan::managed_byte_channel& channel, std::uint64_t old_generation,
-            std::uint64_t new_generation) {
-            CHECK(old_generation == 1);
-            CHECK(new_generation == 2);
-            CHECK(channel.state() == shmchan::managed_channel_state::replaying);
-            CHECK(peer.try_send("external-producer-is-gated", 999) ==
-                  shmchan::channel_status::recovery_in_progress);
-            CHECK(channel.send("from-upstream-outbox", 301) ==
-                  shmchan::channel_status::success);
-            auto during_replay = peer.receive_for(1s);
-            CHECK(during_replay);
-            CHECK(during_replay->message_id() == 301);
-            CHECK(during_replay->ack() == shmchan::channel_status::success);
-            CHECK(channel.send("after-replay-drain", 303) ==
-                  shmchan::channel_status::success);
-        });
-    CHECK(rebuilt.code == shmchan::channel_status::success);
-    CHECK(rebuilt.previous_generation == 1);
-    CHECK(rebuilt.generation == 2);
-    CHECK(peer.generation() == 2);
-    CHECK(old_reservation->commit(0) == shmchan::channel_status::generation_changed);
-
-    auto replayed = peer.receive_for(1s);
-    CHECK(replayed);
-    CHECK(replayed->generation() == 2);
-    CHECK(replayed->message_id() == 303);
-    CHECK(as_string(replayed->bytes()) == "after-replay-drain");
-    CHECK(replayed->ack() == shmchan::channel_status::success);
-    CHECK(supervisor.stats().rebuilt_generations == 1);
-
-    CHECK(supervisor.mark_broken());
-    bool replay_failed = false;
+    bool layout_mismatch_detected = false;
     try {
-        (void)supervisor.rebuild_with_replay(
-            [](shmchan::managed_byte_channel&, std::uint64_t, std::uint64_t) {
-                throw std::runtime_error("synthetic replay failure");
-            });
-    } catch (const std::runtime_error&) {
-        replay_failed = true;
+        auto different = options;
+        different.message_capacity += 1;
+        auto incompatible =
+            shmchan::managed_byte_channel::open_or_create(name, different);
+        (void)incompatible;
+    } catch (const std::invalid_argument&) {
+        layout_mismatch_detected = true;
     }
-    CHECK(replay_failed);
-    CHECK(supervisor.state() == shmchan::managed_channel_state::broken);
-    CHECK(supervisor.reason() == shmchan::break_reason::replay_failed);
-    CHECK(supervisor.stats().replay_failures == 1);
-    const auto recovered = supervisor.rebuild();
-    CHECK(recovered.code == shmchan::channel_status::success);
-    CHECK(recovered.generation == 4);
+    CHECK(layout_mismatch_detected);
 }
 
-void test_reservation_timeout_breaks_generation() {
-    const auto name = unique_name("reservation-timeout");
+void test_open_or_create_recovers_abandoned_initialization() {
+    const auto name = unique_name("abandoned-init");
     unlink_guard cleanup(name);
-    auto options = test_options();
-    options.reservation_timeout = 40ms;
-    options.participant_timeout = 500ms;
-    auto channel = shmchan::managed_byte_channel::create(name, options);
-    auto reservation = channel.try_reserve(401);
-    CHECK(reservation);
+    const auto object_name = shmchan::detail::managed_object_name(name);
+    const int fd = ::shm_open(
+        object_name.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    CHECK(fd >= 0);
+    CHECK(::close(fd) == 0);
 
-    CHECK(wait_until(
-        [&] {
-            (void)channel.supervise_once();
-            return channel.state() == shmchan::managed_channel_state::broken;
-        },
-        1s));
-    CHECK(channel.reason() == shmchan::break_reason::reservation_timeout);
-    CHECK(channel.rebuild().code == shmchan::channel_status::success);
-    CHECK(reservation->commit(0) == shmchan::channel_status::generation_changed);
+    auto channel =
+        shmchan::managed_byte_channel::open_or_create(name, test_options());
+    CHECK(channel.state() == shmchan::managed_channel_state::healthy);
+    CHECK(channel.send("initialized") == shmchan::channel_status::success);
+    auto received = channel.receive_for(1s);
+    CHECK(received && as_string(*received) == "initialized");
 }
 
-void test_kill9_participant_and_upstream_replay() {
-    const auto name = unique_name("kill9-participant");
+void test_killed_incomplete_producer_is_recovered_in_place() {
+    const auto name = unique_name("producer-crash");
     unlink_guard cleanup(name);
     auto options = test_options();
     options.message_capacity = 4;
-    options.participant_timeout = 180ms;
-    options.reservation_timeout = 2s;
-    {
-        auto creator = shmchan::managed_byte_channel::create(name, options);
-    }
+    auto channel = shmchan::managed_byte_channel::create(name, options);
+    CHECK(channel.send("published-before-crash") ==
+          shmchan::channel_status::success);
 
     std::array<int, 2> ready_pipe{};
     CHECK(::pipe(ready_pipe.data()) == 0);
     const pid_t child = ::fork();
     if (child < 0) {
-        throw std::system_error(errno, std::generic_category(), "fork participant crash");
+        throw std::system_error(errno, std::generic_category(), "fork producer crash");
     }
     if (child == 0) {
         (void)::close(ready_pipe[0]);
         try {
-            auto child_options = open_options();
-            child_options.role = shmchan::participant_role::producer;
-            child_options.monitor_peers = false;
-            auto producer = shmchan::managed_byte_channel::open(name, child_options);
-            auto reservation = producer.try_reserve(501);
-            if (!reservation) {
+            auto mapping = shmchan::detail::open_managed_mapping(
+                name, options.protocol);
+            if (::pthread_mutex_lock(std::addressof(mapping->header->mutex)) != 0) {
                 ::_exit(20);
             }
-            const std::string payload = "unpublished-before-sigkill";
-            std::memcpy(reservation->buffer().data(), payload.data(), payload.size());
+            auto& slot = mapping->slots[1];
+            slot.state.store(
+                static_cast<std::uint32_t>(
+                    shmchan::detail::managed_slot_state::writing),
+                std::memory_order_release);
+            --mapping->header->free_slots;
+            ++mapping->header->writing_messages;
+            slot.sequence = mapping->header->next_sequence++;
+            const std::string partial = "only-half-written";
+            std::memcpy(
+                mapping->payload(1).data(), partial.data(), partial.size() / 2);
             write_ready_byte(ready_pipe[1]);
             (void)::kill(::getpid(), SIGKILL);
             ::_exit(21);
@@ -495,132 +303,57 @@ void test_kill9_participant_and_upstream_replay() {
             ::_exit(22);
         }
     }
-    (void)::close(ready_pipe[1]);
-    read_ready_byte(ready_pipe[0]);
-    (void)::close(ready_pipe[0]);
-    check_child_killed(child, SIGKILL);
-
-    auto supervisor_options = open_options();
-    supervisor_options.role = shmchan::participant_role::supervisor;
-    supervisor_options.monitor_peers = false;
-    auto supervisor = shmchan::managed_byte_channel::open(name, supervisor_options);
-    CHECK(wait_until(
-        [&] {
-            (void)supervisor.supervise_once();
-            return supervisor.state() == shmchan::managed_channel_state::broken;
-        },
-        2s));
-    CHECK(supervisor.reason() == shmchan::break_reason::participant_timeout);
-    CHECK(supervisor.stats().failed_participant_session != 0);
-
-    const auto rebuilt = supervisor.rebuild_with_replay(
-        [](shmchan::managed_byte_channel& channel, std::uint64_t, std::uint64_t) {
-            CHECK(channel.send("replayed-from-durable-outbox", 501) ==
-                  shmchan::channel_status::success);
-        });
-    CHECK(rebuilt.code == shmchan::channel_status::success);
-    CHECK(rebuilt.generation == 2);
-    auto delivery = supervisor.receive_for(1s);
-    CHECK(delivery);
-    CHECK(delivery->message_id() == 501);
-    CHECK(as_string(delivery->bytes()) == "replayed-from-durable-outbox");
-    CHECK(delivery->ack() == shmchan::channel_status::success);
-    CHECK(supervisor.stats().stale_participants == 0);
-}
-
-void test_kill9_during_replay_is_recoverable() {
-    const auto name = unique_name("kill9-replay");
-    unlink_guard cleanup(name);
-    auto options = test_options();
-    options.participant_timeout = 180ms;
-    {
-        auto creator = shmchan::managed_byte_channel::create(name, options);
-        CHECK(creator.mark_broken());
-    }
-
-    std::array<int, 2> ready_pipe{};
-    CHECK(::pipe(ready_pipe.data()) == 0);
-    const pid_t child = ::fork();
-    if (child < 0) {
-        throw std::system_error(errno, std::generic_category(), "fork replay crash");
-    }
-    if (child == 0) {
-        (void)::close(ready_pipe[0]);
-        try {
-            auto child_options = open_options();
-            child_options.monitor_peers = false;
-            child_options.role = shmchan::participant_role::supervisor;
-            auto rebuilder = shmchan::managed_byte_channel::open(name, child_options);
-            (void)rebuilder.rebuild_with_replay(
-                [&](shmchan::managed_byte_channel& channel, std::uint64_t, std::uint64_t) {
-                    if (channel.send("partial-replay", 551) !=
-                        shmchan::channel_status::success) {
-                        ::_exit(70);
-                    }
-                    write_ready_byte(ready_pipe[1]);
-                    (void)::kill(::getpid(), SIGKILL);
-                    ::_exit(71);
-                });
-            ::_exit(72);
-        } catch (...) {
-            ::_exit(73);
-        }
-    }
-    child_guard replay_child_cleanup(child);
 
     (void)::close(ready_pipe[1]);
     read_ready_byte(ready_pipe[0]);
     (void)::close(ready_pipe[0]);
     check_child_killed(child, SIGKILL);
-    replay_child_cleanup.release();
 
-    auto supervisor_options = open_options();
-    supervisor_options.monitor_peers = false;
-    supervisor_options.role = shmchan::participant_role::supervisor;
-    auto supervisor = shmchan::managed_byte_channel::open(name, supervisor_options);
-    CHECK(supervisor.state() == shmchan::managed_channel_state::replaying);
-    CHECK(wait_until(
-        [&] {
-            (void)supervisor.supervise_once();
-            return supervisor.state() == shmchan::managed_channel_state::broken;
-        },
-        2s));
-    CHECK(supervisor.generation() == 2);
-    const auto recovered = supervisor.rebuild();
-    CHECK(recovered.code == shmchan::channel_status::success);
-    CHECK(recovered.generation == 3);
-    CHECK(supervisor.try_receive().code == shmchan::channel_status::would_block);
+    // The next normal operation repairs the abandoned WRITING slot. No generation
+    // switch and no supervisor are involved.
+    CHECK(channel.send("published-after-crash") ==
+          shmchan::channel_status::success);
+    CHECK(channel.state() == shmchan::managed_channel_state::healthy);
+
+    auto before = channel.receive_for(1s);
+    auto after = channel.receive_for(1s);
+    CHECK(before && as_string(*before) == "published-before-crash");
+    CHECK(after && as_string(*after) == "published-after-crash");
+    CHECK(channel.try_receive().code == shmchan::channel_status::would_block);
+
+    const auto stats = channel.stats();
+    CHECK(stats.owner_death_recoveries >= 1);
+    CHECK(stats.discarded_incomplete_writes == 1);
+    CHECK(stats.free_slots == 4);
 }
 
-void test_kill9_while_holding_robust_mutex() {
-    const auto name = unique_name("kill9-mutex");
+void test_killed_consumer_during_copy_keeps_ready_message() {
+    const auto name = unique_name("consumer-crash");
     unlink_guard cleanup(name);
     auto options = test_options();
-    options.message_capacity = 4;
-    options.max_message_size = 64;
-    {
-        auto creator = shmchan::managed_byte_channel::create(name, options);
-    }
+    options.message_capacity = 2;
+    auto channel = shmchan::managed_byte_channel::create(name, options);
+    CHECK(channel.send("must-survive-incomplete-receive") ==
+          shmchan::channel_status::success);
 
     std::array<int, 2> ready_pipe{};
     CHECK(::pipe(ready_pipe.data()) == 0);
     const pid_t child = ::fork();
     if (child < 0) {
-        throw std::system_error(errno, std::generic_category(), "fork mutex crash");
+        throw std::system_error(errno, std::generic_category(), "fork consumer crash");
     }
     if (child == 0) {
         (void)::close(ready_pipe[0]);
         try {
-            auto control = shmchan::detail::open_managed_control(name, options.protocol);
-            auto data = shmchan::detail::open_managed_data(
-                control->base_name,
-                1,
-                options.message_capacity,
-                options.max_message_size,
-                options.protocol);
-            if (::pthread_mutex_lock(std::addressof(data->header->mutex)) != 0) {
+            auto mapping = shmchan::detail::open_managed_mapping(
+                name, options.protocol);
+            if (::pthread_mutex_lock(std::addressof(mapping->header->mutex)) != 0) {
                 ::_exit(30);
             }
+            // receive() intentionally keeps the slot READY while copying. This models
+            // death after a partial copy but before the slot is released.
+            volatile std::byte copied = mapping->payload(0)[0];
+            (void)copied;
             write_ready_byte(ready_pipe[1]);
             (void)::kill(::getpid(), SIGKILL);
             ::_exit(31);
@@ -634,240 +367,245 @@ void test_kill9_while_holding_robust_mutex() {
     (void)::close(ready_pipe[0]);
     check_child_killed(child, SIGKILL);
 
-    auto no_monitor = open_options();
-    no_monitor.monitor_peers = false;
-    auto channel = shmchan::managed_byte_channel::open(name, no_monitor);
-    CHECK(channel.try_send("detect-owner-death", 601) == shmchan::channel_status::broken);
-    CHECK(channel.state() == shmchan::managed_channel_state::broken);
-    CHECK(channel.reason() == shmchan::break_reason::robust_mutex_owner_died);
-    CHECK(channel.rebuild().code == shmchan::channel_status::success);
-    CHECK(channel.send("after-rebuild", 602) == shmchan::channel_status::success);
-    auto delivery = channel.receive_for(1s);
-    CHECK(delivery);
-    CHECK(delivery->ack() == shmchan::channel_status::success);
+    auto message = channel.receive_for(1s);
+    CHECK(message);
+    CHECK(as_string(*message) == "must-survive-incomplete-receive");
+    CHECK(channel.state() == shmchan::managed_channel_state::healthy);
+    CHECK(channel.stats().owner_death_recoveries >= 1);
 }
 
-void test_stopped_mutex_owner_times_out() {
-    const auto name = unique_name("stopped-mutex");
+void test_blocked_receiver_recovers_publish_without_wake() {
+    const auto name = unique_name("publish-without-wake");
     unlink_guard cleanup(name);
     auto options = test_options();
-    options.message_capacity = 4;
-    options.max_message_size = 64;
-    options.participant_timeout = 180ms;
-    {
-        auto creator = shmchan::managed_byte_channel::create(name, options);
+    options.message_capacity = 2;
+    auto channel = shmchan::managed_byte_channel::create(name, options);
+
+    std::array<int, 2> child_ready{};
+    std::array<int, 2> start_publish{};
+    CHECK(::pipe(child_ready.data()) == 0);
+    CHECK(::pipe(start_publish.data()) == 0);
+    const pid_t child = ::fork();
+    if (child < 0) {
+        throw std::system_error(errno, std::generic_category(), "fork publish crash");
     }
+    if (child == 0) {
+        (void)::close(child_ready[0]);
+        (void)::close(start_publish[1]);
+        try {
+            auto mapping = shmchan::detail::open_managed_mapping(
+                name, options.protocol);
+            write_ready_byte(child_ready[1]);
+            read_ready_byte(start_publish[0]);
+            if (::pthread_mutex_lock(std::addressof(mapping->header->mutex)) != 0) {
+                ::_exit(35);
+            }
+            auto& slot = mapping->slots[0];
+            slot.state.store(
+                static_cast<std::uint32_t>(
+                    shmchan::detail::managed_slot_state::writing),
+                std::memory_order_release);
+            --mapping->header->free_slots;
+            ++mapping->header->writing_messages;
+            slot.sequence = mapping->header->next_sequence++;
+            const std::string payload = "published-before-owner-death";
+            std::memcpy(
+                mapping->payload(0).data(), payload.data(), payload.size());
+            slot.payload_size = static_cast<std::uint32_t>(payload.size());
+            slot.state.store(
+                static_cast<std::uint32_t>(
+                    shmchan::detail::managed_slot_state::ready),
+                std::memory_order_release);
+            // Die before repairing counts, unlocking, or incrementing event_epoch.
+            (void)::kill(::getpid(), SIGKILL);
+            ::_exit(36);
+        } catch (...) {
+            ::_exit(37);
+        }
+    }
+
+    (void)::close(child_ready[1]);
+    (void)::close(start_publish[0]);
+    read_ready_byte(child_ready[0]);
+    (void)::close(child_ready[0]);
+
+    shmchan::receive_result<shmchan::managed_byte_channel::buffer_type> result;
+    std::thread receiver([&] { result = channel.receive_for(2s); });
+    std::this_thread::sleep_for(100ms);
+    write_ready_byte(start_publish[1]);
+    (void)::close(start_publish[1]);
+
+    receiver.join();
+    check_child_killed(child, SIGKILL);
+    CHECK(result);
+    CHECK(as_string(*result) == "published-before-owner-death");
+    CHECK(channel.state() == shmchan::managed_channel_state::healthy);
+}
+
+void test_unrelated_process_death_does_not_affect_channel() {
+    const auto name = unique_name("idle-crash");
+    unlink_guard cleanup(name);
+    auto channel =
+        shmchan::managed_byte_channel::create(name, test_options());
+    CHECK(channel.send("queued") == shmchan::channel_status::success);
 
     std::array<int, 2> ready_pipe{};
     CHECK(::pipe(ready_pipe.data()) == 0);
     const pid_t child = ::fork();
     if (child < 0) {
-        throw std::system_error(errno, std::generic_category(), "fork stopped mutex owner");
+        throw std::system_error(errno, std::generic_category(), "fork idle crash");
     }
     if (child == 0) {
         (void)::close(ready_pipe[0]);
         try {
-            auto control = shmchan::detail::open_managed_control(name, options.protocol);
-            auto data = shmchan::detail::open_managed_data(
-                control->base_name,
-                1,
-                options.message_capacity,
-                options.max_message_size,
-                options.protocol);
-            if (::pthread_mutex_lock(std::addressof(data->header->mutex)) != 0) {
-                ::_exit(60);
+            auto peer = shmchan::managed_byte_channel::open(name);
+            (void)peer;
+            write_ready_byte(ready_pipe[1]);
+            (void)::kill(::getpid(), SIGKILL);
+            ::_exit(40);
+        } catch (...) {
+            ::_exit(41);
+        }
+    }
+
+    (void)::close(ready_pipe[1]);
+    read_ready_byte(ready_pipe[0]);
+    (void)::close(ready_pipe[0]);
+    check_child_killed(child, SIGKILL);
+
+    CHECK(channel.state() == shmchan::managed_channel_state::healthy);
+    auto queued = channel.receive_for(1s);
+    CHECK(queued && as_string(*queued) == "queued");
+    CHECK(channel.send("still-works") == shmchan::channel_status::success);
+    auto next = channel.receive_for(1s);
+    CHECK(next && as_string(*next) == "still-works");
+}
+
+void test_stopped_mutex_owner_times_out_without_destroying_channel() {
+    const auto name = unique_name("stopped-owner");
+    unlink_guard cleanup(name);
+    auto options = test_options();
+    auto channel = shmchan::managed_byte_channel::create(name, options);
+    CHECK(channel.send("already-ready") == shmchan::channel_status::success);
+
+    std::array<int, 2> ready_pipe{};
+    CHECK(::pipe(ready_pipe.data()) == 0);
+    const pid_t child = ::fork();
+    if (child < 0) {
+        throw std::system_error(errno, std::generic_category(), "fork stopped owner");
+    }
+    child_guard cleanup_child(child);
+    if (child == 0) {
+        (void)::close(ready_pipe[0]);
+        try {
+            auto mapping = shmchan::detail::open_managed_mapping(
+                name, options.protocol);
+            if (::pthread_mutex_lock(std::addressof(mapping->header->mutex)) != 0) {
+                ::_exit(50);
             }
             write_ready_byte(ready_pipe[1]);
             (void)::raise(SIGSTOP);
-            ::_exit(61);
+            ::_exit(51);
         } catch (...) {
-            ::_exit(62);
+            ::_exit(52);
         }
     }
-    child_guard stopped_owner_cleanup(child);
 
     (void)::close(ready_pipe[1]);
     read_ready_byte(ready_pipe[0]);
     (void)::close(ready_pipe[0]);
     int stopped_status = 0;
-    CHECK(::waitpid(child, &stopped_status, WUNTRACED) == child);
+    CHECK(::waitpid(child, std::addressof(stopped_status), WUNTRACED) == child);
     CHECK(WIFSTOPPED(stopped_status));
 
-    auto no_monitor = open_options();
-    no_monitor.monitor_peers = false;
-    auto channel = shmchan::managed_byte_channel::open(name, no_monitor);
-    const auto started = std::chrono::steady_clock::now();
-    CHECK(channel.try_send("lock-must-time-out", 603) == shmchan::channel_status::broken);
-    const auto elapsed = std::chrono::steady_clock::now() - started;
-    CHECK(elapsed >= 100ms);
-    CHECK(elapsed < 2s);
-    CHECK(channel.reason() == shmchan::break_reason::mutex_lock_timeout);
+    CHECK(channel.send_for("must-time-out", 40ms) ==
+          shmchan::channel_status::timed_out);
+    CHECK(channel.state() == shmchan::managed_channel_state::healthy);
 
     CHECK(::kill(child, SIGKILL) == 0);
     check_child_killed(child, SIGKILL);
-    stopped_owner_cleanup.release();
-    CHECK(channel.rebuild().code == shmchan::channel_status::success);
+    cleanup_child.release();
+
+    CHECK(channel.send("after-owner-death") ==
+          shmchan::channel_status::success);
+    auto first = channel.receive_for(1s);
+    auto second = channel.receive_for(1s);
+    CHECK(first && as_string(*first) == "already-ready");
+    CHECK(second && as_string(*second) == "after-owner-death");
+    CHECK(channel.state() == shmchan::managed_channel_state::healthy);
 }
 
-void test_stopped_participant_is_fenced_after_rebuild() {
-    const auto name = unique_name("stopped-fencing");
-    unlink_guard cleanup(name);
-    auto options = test_options();
-    options.participant_timeout = 180ms;
-    {
-        auto creator = shmchan::managed_byte_channel::create(name, options);
-    }
-
-    std::array<int, 2> ready_pipe{};
-    std::array<int, 2> result_pipe{};
-    CHECK(::pipe(ready_pipe.data()) == 0);
-    CHECK(::pipe(result_pipe.data()) == 0);
-    const pid_t child = ::fork();
-    if (child < 0) {
-        throw std::system_error(errno, std::generic_category(), "fork stopped participant");
-    }
-    if (child == 0) {
-        (void)::close(ready_pipe[0]);
-        (void)::close(result_pipe[0]);
-        try {
-            auto child_options = open_options();
-            child_options.monitor_peers = false;
-            auto participant = shmchan::managed_byte_channel::open(name, child_options);
-            write_ready_byte(ready_pipe[1]);
-            (void)::raise(SIGSTOP);
-            write_status_code(result_pipe[1], participant.try_send("must-be-fenced"));
-            participant = shmchan::managed_byte_channel{};
-            ::_exit(0);
-        } catch (...) {
-            ::_exit(50);
-        }
-    }
-    child_guard stopped_child_cleanup(child);
-
-    (void)::close(ready_pipe[1]);
-    (void)::close(result_pipe[1]);
-    read_ready_byte(ready_pipe[0]);
-    (void)::close(ready_pipe[0]);
-    int stopped_status = 0;
-    CHECK(::waitpid(child, &stopped_status, WUNTRACED) == child);
-    CHECK(WIFSTOPPED(stopped_status));
-    CHECK(WSTOPSIG(stopped_status) == SIGSTOP);
-
-    auto supervisor_options = open_options();
-    supervisor_options.monitor_peers = false;
-    supervisor_options.role = shmchan::participant_role::supervisor;
-    auto supervisor = shmchan::managed_byte_channel::open(name, supervisor_options);
-    CHECK(wait_until(
-        [&] {
-            (void)supervisor.supervise_once();
-            return supervisor.state() == shmchan::managed_channel_state::broken;
-        },
-        2s));
-    CHECK(supervisor.rebuild().code == shmchan::channel_status::success);
-    CHECK(::kill(child, SIGCONT) == 0);
-    CHECK(read_status_code(result_pipe[0]) == shmchan::channel_status::participant_expired);
-    (void)::close(result_pipe[0]);
-    check_child_exited(child, 0);
-    stopped_child_cleanup.release();
-    CHECK(supervisor.state() == shmchan::managed_channel_state::healthy);
-}
-
-void test_cross_process_send_receive_ack() {
+void test_cross_process_send_receive() {
     const auto name = unique_name("cross-process");
     unlink_guard cleanup(name);
-    const auto options = test_options();
-    {
-        auto creator = shmchan::managed_byte_channel::create(name, options);
-    }
+    auto channel =
+        shmchan::managed_byte_channel::create(name, test_options());
 
-    std::array<int, 2> ready_pipe{};
-    CHECK(::pipe(ready_pipe.data()) == 0);
     const pid_t child = ::fork();
     if (child < 0) {
-        throw std::system_error(errno, std::generic_category(), "fork consumer");
+        throw std::system_error(errno, std::generic_category(), "fork cross process");
     }
     if (child == 0) {
-        (void)::close(ready_pipe[0]);
-        int exit_code = 0;
         try {
-            auto consumer_options = open_options();
-            consumer_options.role = shmchan::participant_role::consumer;
-            {
-                auto consumer =
-                    shmchan::managed_byte_channel::open(name, consumer_options);
-                write_ready_byte(ready_pipe[1]);
-                auto delivery = consumer.receive_for(2s);
-                if (!delivery || delivery->message_id() != 701 ||
-                    as_string(delivery->bytes()) != "cross-process" ||
-                    delivery->ack() != shmchan::channel_status::success) {
-                    exit_code = 40;
-                } else if (consumer.receive_for(2s).code !=
-                           shmchan::channel_status::closed) {
-                    exit_code = 41;
+            auto producer = shmchan::managed_byte_channel::open(name);
+            for (std::uint64_t id = 1; id <= 100; ++id) {
+                const auto text = "child-" + std::to_string(id);
+                if (producer.send_for(text, 2s) !=
+                    shmchan::channel_status::success) {
+                    ::_exit(60);
                 }
             }
+            ::_exit(0);
         } catch (...) {
-            exit_code = 42;
+            ::_exit(61);
         }
-        ::_exit(exit_code);
     }
 
-    (void)::close(ready_pipe[1]);
-    read_ready_byte(ready_pipe[0]);
-    (void)::close(ready_pipe[0]);
-    auto producer_options = open_options();
-    producer_options.role = shmchan::participant_role::producer;
-    auto producer = shmchan::managed_byte_channel::open(name, producer_options);
-    CHECK(producer.send("cross-process", 701) == shmchan::channel_status::success);
-    CHECK(producer.close());
+    for (std::uint64_t id = 1; id <= 100; ++id) {
+        auto message = channel.receive_for(2s);
+        CHECK(message);
+        CHECK(as_string(*message) == "child-" + std::to_string(id));
+    }
     check_child_exited(child, 0);
-    CHECK(producer.stats().acknowledged_messages == 1);
 }
 
-void test_mpmc_threads() {
-    constexpr std::size_t producer_count = 4;
-    constexpr std::size_t consumer_count = 4;
-    constexpr std::size_t messages_per_producer = 500;
-    constexpr std::size_t message_count = producer_count * messages_per_producer;
-
+void test_threaded_mpmc() {
     const auto name = unique_name("mpmc");
     unlink_guard cleanup(name);
     auto options = test_options();
     options.message_capacity = 64;
-    options.max_message_size = sizeof(std::uint64_t);
-    options.acknowledgment_timeout = 2s;
-    options.participant_timeout = 2s;
+    options.max_message_size = 64;
     auto channel = shmchan::managed_byte_channel::create(name, options);
 
-    std::vector<std::atomic<unsigned char>> seen(message_count);
-    for (auto& count : seen) {
-        count.store(0, std::memory_order_relaxed);
-    }
-    std::atomic<std::size_t> received{0};
+    constexpr std::size_t producer_count = 4;
+    constexpr std::size_t consumer_count = 4;
+    constexpr std::size_t messages_per_producer = 400;
+    constexpr std::size_t total = producer_count * messages_per_producer;
+
     std::atomic<bool> failed{false};
+    std::mutex received_mutex;
+    std::unordered_set<std::string> received_messages;
+    received_messages.reserve(total);
 
     std::vector<std::thread> consumers;
-    for (std::size_t index = 0; index < consumer_count; ++index) {
+    for (std::size_t consumer = 0; consumer < consumer_count; ++consumer) {
         consumers.emplace_back([&] {
             for (;;) {
-                auto delivery = channel.receive();
-                if (delivery.code == shmchan::channel_status::closed) {
+                auto result = channel.receive_for(1s);
+                if (result) {
+                    std::scoped_lock lock(received_mutex);
+                    if (!received_messages.insert(as_string(*result)).second) {
+                        failed.store(true, std::memory_order_release);
+                    }
+                    continue;
+                }
+                if (result.code == shmchan::channel_status::closed) {
                     return;
                 }
-                if (!delivery || delivery->bytes().size() != sizeof(std::uint64_t)) {
-                    failed.store(true, std::memory_order_relaxed);
+                if (result.code != shmchan::channel_status::timed_out) {
+                    failed.store(true, std::memory_order_release);
                     return;
                 }
-                std::uint64_t value = 0;
-                std::memcpy(&value, delivery->bytes().data(), sizeof(value));
-                if (value >= message_count ||
-                    delivery->ack() != shmchan::channel_status::success) {
-                    failed.store(true, std::memory_order_relaxed);
-                    return;
-                }
-                seen[static_cast<std::size_t>(value)].fetch_add(
-                    1, std::memory_order_relaxed);
-                received.fetch_add(1, std::memory_order_relaxed);
             }
         });
     }
@@ -875,15 +613,13 @@ void test_mpmc_threads() {
     std::vector<std::thread> producers;
     for (std::size_t producer = 0; producer < producer_count; ++producer) {
         producers.emplace_back([&, producer] {
-            const auto begin = producer * messages_per_producer;
-            const auto end = begin + messages_per_producer;
-            for (std::size_t value = begin; value < end; ++value) {
-                const auto encoded = static_cast<std::uint64_t>(value);
-                const auto bytes = std::as_bytes(
-                    std::span<const std::uint64_t>{std::addressof(encoded), 1});
-                if (channel.send(bytes, static_cast<std::uint64_t>(value + 1)) !=
+            for (std::size_t index = 0; index < messages_per_producer; ++index) {
+                const auto id = static_cast<std::uint64_t>(
+                    producer * messages_per_producer + index + 1);
+                const auto payload = "message-" + std::to_string(id);
+                if (channel.send_for(payload, 5s) !=
                     shmchan::channel_status::success) {
-                    failed.store(true, std::memory_order_relaxed);
+                    failed.store(true, std::memory_order_release);
                     return;
                 }
             }
@@ -898,37 +634,56 @@ void test_mpmc_threads() {
         consumer.join();
     }
 
-    CHECK(!failed.load(std::memory_order_relaxed));
-    CHECK(received.load(std::memory_order_relaxed) == message_count);
-    for (const auto& count : seen) {
-        CHECK(count.load(std::memory_order_relaxed) == 1);
-    }
+    CHECK(!failed.load(std::memory_order_acquire));
+    CHECK(received_messages.size() == total);
     const auto stats = channel.stats();
-    CHECK(stats.sent_messages == message_count);
-    CHECK(stats.acknowledged_messages == message_count);
+    CHECK(stats.sent_messages == total);
+    CHECK(stats.received_messages == total);
+    CHECK(stats.ready_messages == 0);
+}
+
+void test_unlink_wakes_waiters_and_fences_old_mapping() {
+    const auto name = unique_name("unlink");
+    auto channel =
+        shmchan::managed_byte_channel::create(name, test_options());
+    std::atomic<shmchan::channel_status> status{shmchan::channel_status::success};
+    std::thread waiter([&] {
+        status.store(channel.receive().code, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(20ms);
+    CHECK(shmchan::managed_byte_channel::unlink(name));
+    waiter.join();
+    CHECK(status.load(std::memory_order_acquire) == shmchan::channel_status::broken);
+    CHECK(channel.try_send("old-mapping") == shmchan::channel_status::broken);
+    CHECK(!shmchan::managed_byte_channel::unlink(name));
+
+    auto replacement =
+        shmchan::managed_byte_channel::open_or_create(name, test_options());
+    unlink_guard cleanup(name);
+    CHECK(replacement.send("new-object") == shmchan::channel_status::success);
+    auto message = replacement.receive_for(1s);
+    CHECK(message && as_string(*message) == "new-object");
 }
 
 } // namespace
 
 int main() {
     try {
-        test_basic_ack_close_and_metrics();
-        test_zero_copy_nack_timeout_and_reservation_cleanup();
-        test_protocol_and_participant_validation();
-        test_unlink_fences_live_handles_and_wakes_waiters();
-        test_generation_rebuild_and_replay();
-        test_reservation_timeout_breaks_generation();
-        test_kill9_participant_and_upstream_replay();
-        test_kill9_during_replay_is_recoverable();
-        test_kill9_while_holding_robust_mutex();
-        test_stopped_mutex_owner_times_out();
-        test_stopped_participant_is_fenced_after_rebuild();
-        test_cross_process_send_receive_ack();
-        test_mpmc_threads();
-        std::cout << "managed channel tests passed\n";
-        return 0;
+        test_basic_variable_messages_and_close();
+        test_timeouts_and_slot_reuse();
+        test_protocol_and_open_or_create();
+        test_open_or_create_recovers_abandoned_initialization();
+        test_killed_incomplete_producer_is_recovered_in_place();
+        test_killed_consumer_during_copy_keeps_ready_message();
+        test_blocked_receiver_recovers_publish_without_wake();
+        test_unrelated_process_death_does_not_affect_channel();
+        test_stopped_mutex_owner_times_out_without_destroying_channel();
+        test_cross_process_send_receive();
+        test_threaded_mpmc();
+        test_unlink_wakes_waiters_and_fences_old_mapping();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
     }
+    return 0;
 }

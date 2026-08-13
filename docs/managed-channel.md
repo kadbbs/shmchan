@@ -1,197 +1,240 @@
-# managed_byte_channel 架构与故障语义
+# `managed_byte_channel` 架构与崩溃语义
 
-`managed_byte_channel` 是 `shmchan` 的生产增强层。它仍是本机、非持久化 IPC，但补上了参与者登记、
-generation 隔离、崩溃检测、整体重建、ACK/重投、协议校验、指标和零拷贝接口。
+`managed_byte_channel` 是本机、非持久化的不定长 MPMC Channel。它的恢复目标不是把消息变成磁盘数据，
+而是保证一个进程死在 `send()` 或 `receive()` 中间时：
 
-它解决的是“某个进程死在共享内存操作中，其他进程不能继续把已损坏的队列当成正常队列使用”的问题。
-它不把共享内存变成磁盘消息队列，也不承诺 exactly-once。
+- 未写完整的消息不会被消费者看到。
+- 已经完整发布的消息不会因为其他进程死亡而丢失。
+- 消费者没有完整复制消息时，共享内存槽位不会删除。
+- 其他生产者和消费者无需重建 Channel，可以继续通信。
 
-## 两层共享内存
+## 单共享内存对象
 
-一个逻辑 Channel 使用一个稳定的控制面和一个按 generation 切换的数据面：
-
-```text
-进程 A ─┐
-进程 B ─┼── mmap ── /orders.shmchan.control
-监督者 ─┘              │
-                       ├─ state / reason / current generation
-                       ├─ protocol id + version
-                       ├─ participant slots + heartbeat
-                       ├─ counters + futex event epoch
-                       │
-                       └─ generation = 7
-                                  │
-                                  ▼
-                         /orders.shmchan.g0000000000000007
-                                  ├─ robust process-shared mutex
-                                  ├─ message descriptors
-                                  └─ fixed-size payload slots
-```
-
-- 控制面名称不变，负责发现当前 generation、进程存活和运行状态。
-- 每次恢复都创建全新的数据面对象；旧映射仍可被持有它的进程安全释放，但不能再向新 generation 提交。
-- 数据面使用进程共享的 robust mutex 保护元数据。进程持锁死亡时，下一位访问者得到 owner-death，立即把
-  当前 generation 标记为 `broken`，不会尝试猜测半完成操作是否安全。
-- 等待者睡在控制面的 futex epoch 上；发送、ACK、NACK、关闭、损坏和重建都会唤醒相关等待者。
-
-## 参与者槽位与 fencing
-
-每次 `create/open` 会占用一个参与者槽位。通常一个进程长期持有一个 Channel 句柄，因此可以把它理解为
-“进程槽位”；同一进程打开多个独立句柄时会占用多个槽位。
-
-`managed_byte_channel` 内含心跳线程，不应把已经打开的句柄跨 `fork()` 继承使用。应先 fork/exec，再在
-各子进程中分别 `open()`；线程间可以共享同一个句柄。
-
-槽位记录：
-
-- PID 和随机 session ID；session ID 用于避免 PID 重用造成误认。
-- 角色：producer、consumer、both 或 supervisor。
-- 登记时间和最后心跳时间。
-- 该参与者最后观察到的 generation。
-
-角色用于诊断和拓扑观察，不是权限控制；库不会据此阻止 API 调用。访问控制依赖 POSIX 共享内存权限和
-应用自己的进程身份管理。
-
-后台心跳线程定期更新时间。超过 `participant_timeout` 后，监督者以 CAS 把槽位从 active 改为 stale，
-并将 Channel 标记为 `broken`。重建时 stale 槽位会被回收。
-
-被判定 stale 的旧进程即使后来恢复运行，也会因为 session 不再匹配而得到
-`participant_expired`；旧预留或旧 delivery 则会得到 `generation_changed`。这就是 fencing：旧参与者无法
-关闭、污染或向新 generation 提交数据。
-
-## 消息状态与 ACK
-
-每条消息按下面的状态机推进：
+每个逻辑 Channel 对应一个 POSIX 共享内存对象：
 
 ```text
-FREE ── reserve ──> WRITING ── commit ──> READY ── receive ──> INFLIGHT
-  ▲                                           ▲                    │
-  │                                           └────── NACK ────────┤
-  │                                                                │
-  └──────────────────────── ACK（且零拷贝读者归零）────────────────┘
-                                                │
-                                                └─ ACK 超时后再次投递
+生产者 P1 ─┐
+生产者 P2 ─┤
+消费者 C1 ─┼── shm_open + mmap ── /orders.shmchan.managed
+消费者 C2 ─┘                           │
+                                      ├─ 布局和协议版本
+                                      ├─ Channel 状态和指标
+                                      ├─ process-shared robust mutex
+                                      ├─ 消息描述符数组
+                                      └─ payload 槽位数组
 ```
 
-- `receive` 只表示投递，不删除消息。
-- `ack()` 才最终释放槽位。
-- `nack()` 立即把消息放回 ready 状态。
-- delivery 未调用 ACK/NACK 就析构时，消息保持 inflight，并在 ACK 租约到期后重投。
-- 超过 `acknowledgment_timeout` 的 inflight 消息可以再次投递，`attempt()` 会递增。
-- 同一条消息可能同时被旧消费者和重投消费者处理，所以语义是 **at-least-once**。
-- `message_id` 在当前 generation 的未完成消息中做重复检测；ACK 后和跨 generation 的永久去重必须由应用
-  或数据库完成。
+所有进程的虚拟地址可以不同，但 `MAP_SHARED` 映射指向同一批内核页面。发送进程正常退出后，已经发布的
+消息仍在共享内存中，直到被消费者取走、显式 `unlink()` 或机器重启。
 
-消费者应先完成业务事务，再 ACK。常见做法是在同一数据库事务中写业务结果和已处理 `message_id`，以便
-重复投递时幂等返回。
+与旧的两层 generation 设计不同，普通进程崩溃不会创建新共享内存对象，也不会清空整个 Channel。
 
-## 崩溃恢复与上游重放
+## 存储布局
 
-恢复采用保守的“整代作废”协议：
-
-1. 心跳超时、写预留超时、robust mutex owner-death 或显式调用把当前状态改为 `broken`。
-2. 所有正常 send/receive 立即停止，等待者被唤醒并得到 `broken`。
-3. 一个监督者调用 `rebuild()` 或 `rebuild_with_replay()`。
-4. 控制对象上的 `flock` 保证同一时刻只有一个重建者。
-5. 创建 `generation + 1` 的全新数据面，回收 stale 槽位，发布新 generation 和 `replaying` 状态，并
-   unlink 旧数据面名称；已有旧映射只活到其本地引用释放。
-6. `rebuild_with_replay` 回调从应用自己的 durable outbox/WAL 重发未确认消息；此时只允许重建者发送，
-   消费者仍可接收和 ACK，以便有界 Channel 流式回放，其他生产者得到 `recovery_in_progress`。
-7. 回放成功后发布 `healthy`。
-
-共享内存中的旧消息不会自动复制到新 generation，因为进程可能死在修改元数据或负载的任意指令之间，
-库无法可靠判断半写消息。需要恢复的消息必须先存在共享内存之外的可靠来源。replay 回调抛出异常时，
-新 generation 会再次标记为 `broken`，并记录 `replay_failures`，不会假装恢复成功。回放期间消费者可能
-已经处理部分消息，因此下一轮重放仍需依靠 `message_id` 幂等；这也是 at-least-once 语义的一部分。
-
-监督者本身在创建阶段崩溃时，文件锁会由内核释放，下一位监督者会清理未完成的
-`building_generation` 后继续。若回放进程死亡，其参与者心跳会超时并令 `replaying` generation
-重新变为 `broken`。
-
-## 协议版本
-
-库布局版本用于校验共享结构、偏移、大小、`pthread_mutex_t` ABI 和 generation 数据面。应用还必须给每种
-wire format 指定稳定的 `protocol_descriptor`：
+创建参数：
 
 ```cpp
-constexpr shmchan::protocol_descriptor document_protocol{
-    shmchan::protocol_id("com.example.document"),
+shmchan::managed_channel_options options;
+options.message_capacity = 1024;
+options.max_message_size = 64 * 1024;
+```
+
+映射布局：
+
+```text
+┌──────────────────────────────────────┐
+│ managed_shared_header                │
+│  magic / layout version / protocol   │
+│  state / reason / futex event epoch  │
+│  robust pthread mutex                │
+│  sequence / slot counts / metrics    │
+├──────────────────────────────────────┤
+│ descriptor[capacity]                 │
+│  state / payload_size / sequence     │
+├──────────────────────────────────────┤
+│ payload[capacity][payload_stride]     │
+└──────────────────────────────────────┘
+```
+
+消息的实际长度由 `payload_size` 保存；每个槽位仍然预留 `max_message_size` 字节。这样避免了共享内存中的
+动态分配器、跨进程指针和内存碎片。
+
+## 槽位状态机
+
+```text
+FREE ────────────────> WRITING ────────────────> READY
+  ▲                      │                         │
+  │                      │ owner death             │ receive 完整复制
+  │                      ▼                         │
+  └──────────────── 自动恢复                       ┘
+```
+
+- `FREE`：可供生产者使用。
+- `WRITING`：生产者正在复制，消费者不可见。
+- `READY`：描述符和 payload 已完整，可以接收。
+
+没有长期存在的 `INFLIGHT` 状态，也没有 ACK/NACK。`receive()` 成功即表示完整消息已经进入消费者的
+进程私有内存，并从共享 Channel 中取走。
+
+## 发送事务
+
+一次 `send()` 的顺序是：
+
+1. 获取 process-shared robust mutex。
+2. 检查 Channel 状态和槽位计数。
+3. 找到 `FREE` 槽位。
+4. 将状态改为 `WRITING`。
+5. 填充 sequence 和描述符。
+6. 复制全部 payload。
+7. 写入最终 `payload_size`。
+8. 最后将状态改为 `READY`。
+9. 释放 mutex，递增 futex event epoch 并唤醒接收者。
+
+`READY` 是消息的发布点。在它之前崩溃，消息不可见；在它之后崩溃，消息已完整。
+
+```text
+进程死亡位置                  下一位访问者的处理
+────────────────────────────────────────────────
+获取槽位之前                  无需处理
+WRITING / payload 复制中       WRITING → FREE
+READY 发布之后                保留 READY 消息
+释放锁之后                    无需处理
+```
+
+## 接收事务
+
+一次 `receive()` 的顺序是：
+
+1. 获取 robust mutex。
+2. 找到 sequence 最小的 `READY` 槽位。
+3. 在进程私有内存中创建 `std::vector<std::byte>`。
+4. 将完整 payload 复制到该 vector。
+5. 复制完成后才把共享槽位改为 `FREE`。
+6. 释放 mutex，唤醒可能等待空槽位的生产者。
+7. 将本地 `std::vector<std::byte>` 返回给调用方。
+
+在第 3～4 步死亡时，共享槽位仍是 `READY`。下一位消费者在 robust mutex 恢复后会再次读取原消息。
+
+在第 5 步之后死亡时，消息已经完整复制到死亡进程的私有内存，但还可能没有进入业务处理代码。此时消息
+不会重投。这是普通 Channel 的“接收即取走”语义，而不是带业务确认的消息队列语义。
+
+## robust mutex 恢复
+
+数据操作使用：
+
+```text
+PTHREAD_PROCESS_SHARED
+PTHREAD_MUTEX_ROBUST
+```
+
+进程在临界区内被 `SIGKILL` 后，Linux 释放其执行上下文。下一位调用者获取 mutex 时会收到
+`EOWNERDEAD`，随后：
+
+1. 调用 `pthread_mutex_consistent()` 接管 mutex。
+2. 扫描所有槽位。
+3. 将所有 `WRITING` 槽位恢复为 `FREE`。
+4. 校验每个 `READY` 的长度和 sequence。
+5. 重新计算 free/writing/ready 计数。
+6. 增加 `owner_death_recoveries` 和 `discarded_incomplete_writes` 指标。
+7. 释放 mutex，正常继续当前 send/receive。
+
+因为 payload 复制始终在 robust mutex 内完成，所以恢复时看到的 `WRITING` 只可能属于已经死亡的 mutex
+owner；不存在仍在锁外写该 payload 的正常生产者。
+
+如果 mutex 返回 `ENOTRECOVERABLE`，或者扫描发现非法状态，Channel 才进入 `broken`。这是内部结构已经
+不能安全解释的严重故障，普通 worker 退出不会触发它。
+
+## SIGSTOP 与 SIGKILL
+
+`SIGSTOP` 只是暂停进程，不代表进程死亡。暂停的进程仍然持有 mutex，因此其他调用：
+
+- `try_send/try_receive` 返回 `would_block`。
+- `send_for/receive_for` 到期后返回 `timed_out`。
+- 无限等待版本继续等待。
+- Channel 保持 `healthy`，不会擅自回收活进程正在使用的内存。
+
+当该进程真正被杀后，robust mutex 的 owner-death 机制才会触发自动恢复。
+
+这避免了把长时间调度暂停错误当成死亡，也避免了旧进程恢复后继续写已经复用的共享地址。
+
+## MPMC 并发
+
+多个进程和线程可以共享同一个 Channel：
+
+```text
+P1 ─┐
+P2 ─┼── robust mutex ── 槽位状态与 payload 复制
+C1 ─┤
+C2 ─┘
+```
+
+锁内部分包括槽位查找和共享内存复制，锁外业务处理可以完全并行。这种实现选择了清晰的崩溃线性化点，
+而不是追求所有复制操作完全并行。
+
+首次接收按照发布 sequence 选择最早的 `READY` 消息。多个生产者的实际调度仍会影响它们获得 sequence
+的先后。
+
+## 等待和背压
+
+Channel 没有空槽位时：
+
+- `try_send()` 返回 `would_block`。
+- `send()` 使用 futex 睡眠，等待消费者释放槽位。
+- `send_for()` 可以返回 `timed_out`。
+
+没有 READY 消息时，接收端采用相同机制。发送、接收、关闭、unlink 和 owner-death 恢复都会更新共享的
+`event_epoch` 并唤醒等待者。阻塞等待还会以很低频率重新检查 robust mutex；这样即使 mutex owner 死在
+更新 `event_epoch` 之前，已经睡眠的调用者也能主动发现 owner death 并完成恢复。
+
+## 协议校验
+
+不同进程必须以相同协议解释 payload：
+
+```cpp
+constexpr shmchan::protocol_descriptor order_protocol{
+    shmchan::protocol_id("com.example.order"),
     3,
 };
 ```
 
-创建端和打开端的 protocol ID/version 必须完全相同。否则 `open` 抛出
-`managed_channel_error`，其 `code()` 为 `protocol_mismatch`。升级不兼容格式时应提升版本，并安排停止、
-清理或迁移旧 Channel，不能让不同版本同时解释同一负载。
+创建端和打开端的 ID/version 不一致时，`open()` 抛出 `managed_channel_error`，错误码为
+`protocol_mismatch`。这只校验声明的协议版本，不替用户校验每条 payload 的业务内容。
 
-## 零拷贝和性能边界
+## 指标
 
-发送端可用 `reserve()` 直接写共享内存，再用 `commit(size)` 发布；接收端可用
-`receive_loaned()` 直接读取映射，再 ACK/NACK。对应 span 只在 reservation/delivery 完成前有效。
-payload 槽位复用时不会为了清零而额外遍历；调用方只能 `commit()` 已经完整初始化的前 N 个字节，不能把
-未写入区域计入长度。
+`stats()` 返回：
 
-```cpp
-auto reservation = channel.reserve(message_id);
-encode_into(reservation->buffer());
-reservation->commit(encoded_size);
+- state 和 break reason。
+- free/writing/ready 槽位数。
+- 等待中的 sender/receiver 数量。
+- 发送和接收的消息数、字节数。
+- robust owner-death 恢复次数。
+- 被丢弃的未完成写入数量。
+- send/receive 超时数。
 
-auto delivery = channel.receive_loaned();
-consume(delivery->bytes());
-delivery->ack();
-```
+正常运行时 `writing_messages` 通常为 0，因为统计快照也在同一个 mutex 下读取。建议监控：
 
-为保证 owner-death 可检测，managed 数据面的元数据操作通过一个很短的 robust mutex 串行化；负载编码和
-零拷贝读取发生在锁外。它优先保证故障边界清晰，不等同于基础 `byte_channel` 的 lock-free 快路径。
+- `state == broken`
+- `owner_death_recoveries` 增长
+- `discarded_incomplete_writes` 增长
+- `free_slots == 0` 持续时间
+- send/receive timeout 增长
 
-每个槽位为最大消息预留空间，数据面大致占用：
+## 非持久化边界
 
-```text
-header + message_capacity × (64 字节描述符 + max_message_size 按 64 字节对齐)
-```
+共享内存通常位于 `/dev/shm` 的 tmpfs：
 
-如果最重要的是极致吞吐、消息大小跨度大，并且能接受任一参与进程崩溃后由外部整体删除队列，可继续使用
-更紧凑的 `byte_channel`。如果必须识别崩溃、阻止旧进程写入并执行可审计恢复，应使用
-`managed_byte_channel`。
+- 单个发送进程退出后，READY 消息仍然存在。
+- 所有业务进程退出后，只要没有 unlink，共享内存对象仍可再次打开。
+- `shm_unlink()`、系统重启、机器掉电或 `/dev/shm` 被清理后，消息消失。
 
-## 可观测指标
+是否把消息另外写入数据库、文件、WAL 或其他系统，是业务自己的选择，不是使用本库的前置条件。
 
-`stats()` 返回当前状态和累计计数，包括：
+## 设计限制
 
-- state、break reason、generation、replay owner session、失败 participant session。
-- free/writing/ready/inflight 数量和最老消息年龄。
-- active/stale participants、等待中的 sender/receiver。
-- sent/delivered/acknowledged/redelivered/NACK 消息与字节数。
-- reservation 取消、send/receive 超时、broken/rebuilt generation、replay failure。
-
-`participants()` 返回各槽位的 PID、session、角色、心跳年龄和 observed generation，可用于状态页或日志。
-指标是共享原子的运行快照，不是跨字段事务快照。
-
-建议至少告警：`state != healthy`、`stale_participants > 0`、`oldest_message_age` 持续增长、重投率升高、
-超时增加和 generation 频繁重建。
-
-## 九项增强对应关系
-
-1. generation：控制面指向独立的版本化数据面。
-2. 参与者登记：PID + session + heartbeat + observed generation。
-3. 监督检测：后台监控和显式 `supervise_once()`。
-4. 异常重建：broken 后由文件锁选出唯一重建者，整代切换。
-5. 上游重放：`rebuild_with_replay()` 对接 durable outbox/WAL。
-6. 故障注入：测试实际覆盖 reservation 中 `SIGKILL`、回放中 `SIGKILL`、持 robust mutex 时
-   `SIGKILL`、持锁 `SIGSTOP` 超时，以及旧参与者恢复后的 fencing。
-7. 协议与指标：应用协议 ID/version、布局 ABI 校验、stats/participants。
-8. ACK 恢复：ACK/NACK、租约超时重投和 attempt 计数。
-9. 零拷贝与性能：发送 reservation、loaned receive、批量便利接口和锁外负载处理。
-
-## 生产使用前仍需完成的应用工作
-
-- 让独立监督进程负责告警和重建；不要把唯一监督者和业务进程放在同一故障域。
-- 使用数据库 outbox、WAL 或其他持久存储保存可重放消息。
-- 消费端按 `message_id` 做幂等或去重，并明确 ACK 与业务事务的顺序。
-- 根据最长 GC/调度暂停设置心跳超时，避免过小阈值误判。
-- 限制共享内存权限，核算 `/dev/shm` 容量，并监控 inode/空间。
-- 在目标内核、libc、编译器和真实负载上做延迟、容量、断电/重启和故障演练。
-- 约定谁可以 `close`、`rebuild`、`unlink`；`unlink` 是管理操作，不应由普通 worker 随意调用。
-
-共享内存位于内核管理的 tmpfs 中，发送进程退出后，已 commit 的消息仍在数据面对象里；它会一直存在到
-被 ACK 后复用、显式 unlink，或系统重启。它不是磁盘持久化，机器故障和重启后的恢复仍依赖上游存储。
+- 全部功能仅限同一台 Linux 主机。
+- 默认是接收即删除，不提供 ACK 重投。
+- 不提供 exactly-once 或持久化。
+- 每个槽位按最大消息长度预留空间。
+- 单个 robust mutex 限制超高并发大消息复制的吞吐。
+- `unlink()` 是全局管理操作，普通 worker 不应随意调用。

@@ -15,11 +15,9 @@ using namespace std::chrono_literals;
 void print_usage(const char* executable) {
     std::cerr << "用法:\n"
               << "  " << executable << " init <name>\n"
-              << "  " << executable << " send <name> <message> [message-id]\n"
+              << "  " << executable << " send <name> <message>\n"
               << "  " << executable << " recv <name>\n"
               << "  " << executable << " status <name>\n"
-              << "  " << executable << " break <name>\n"
-              << "  " << executable << " rebuild <name>\n"
               << "  " << executable << " close <name>\n"
               << "  " << executable << " cleanup <name>\n";
 }
@@ -50,9 +48,10 @@ int main(int argc, char** argv) {
             shmchan::managed_channel_options options;
             options.message_capacity = 1024;
             options.max_message_size = 64 * 1024;
-            auto channel = shmchan::managed_byte_channel::create(name, options);
-            std::cout << "已创建 " << channel.name() << "，generation="
-                      << channel.generation() << '\n';
+            auto channel = shmchan::managed_byte_channel::open_or_create(name, options);
+            std::cout << "已打开 " << channel.name()
+                      << "，capacity=" << channel.capacity()
+                      << "，max_message_size=" << channel.max_message_size() << '\n';
             return 0;
         }
 
@@ -68,47 +67,35 @@ int main(int argc, char** argv) {
                 print_usage(argv[0]);
                 return 2;
             }
-            const auto message_id = argc >= 5 ? std::stoull(argv[4]) : 0ULL;
-            require_success(channel.send(argv[3], message_id), "send");
-            std::cout << "发送成功，generation=" << channel.generation() << '\n';
+            require_success(channel.send(argv[3]), "send");
+            std::cout << "发送成功\n";
             return 0;
         }
         if (command == "recv") {
-            auto delivery = channel.receive_for(5s);
-            if (!delivery) {
-                std::cout << "接收结束: " << shmchan::to_string(delivery.code) << '\n';
-                return delivery.code == shmchan::channel_status::timed_out ? 3 : 1;
+            auto message = channel.receive_for(5s);
+            if (!message) {
+                std::cout << "接收结束: " << shmchan::to_string(message.code) << '\n';
+                return message.code == shmchan::channel_status::timed_out ? 3 : 1;
             }
-            std::cout << "message_id=" << delivery->message_id()
-                      << " generation=" << delivery->generation()
-                      << " attempt=" << delivery->attempt()
-                      << " payload=" << as_string(delivery->bytes()) << '\n';
-            require_success(delivery->ack(), "ack");
+            std::cout << "payload="
+                      << as_string(std::span<const std::byte>{
+                             message->data(), message->size()})
+                      << '\n';
             return 0;
         }
         if (command == "status") {
             const auto stats = channel.stats();
             std::cout << "state=" << shmchan::to_string(stats.state)
                       << " reason=" << shmchan::to_string(stats.reason)
-                      << " generation=" << stats.generation
-                      << " participants=" << stats.active_participants
+                      << " free=" << stats.free_slots
+                      << " writing=" << stats.writing_messages
                       << " ready=" << stats.ready_messages
-                      << " inflight=" << stats.inflight_messages
                       << " sent=" << stats.sent_messages
-                      << " acked=" << stats.acknowledged_messages
-                      << " redelivered=" << stats.redelivered_messages << '\n';
+                      << " received=" << stats.received_messages
+                      << " owner_death_recoveries=" << stats.owner_death_recoveries
+                      << " discarded_incomplete_writes="
+                      << stats.discarded_incomplete_writes << '\n';
             return 0;
-        }
-        if (command == "break") {
-            std::cout << (channel.mark_broken() ? "已标记 broken" : "状态未改变") << '\n';
-            return 0;
-        }
-        if (command == "rebuild") {
-            const auto result = channel.rebuild();
-            std::cout << "rebuild=" << shmchan::to_string(result.code)
-                      << " old_generation=" << result.previous_generation
-                      << " new_generation=" << result.generation << '\n';
-            return result.code == shmchan::channel_status::success ? 0 : 1;
         }
         if (command == "close") {
             std::cout << (channel.close() ? "已关闭" : "状态未改变") << '\n';

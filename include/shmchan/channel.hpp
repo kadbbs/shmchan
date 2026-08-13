@@ -41,13 +41,7 @@ enum class channel_status {
     timed_out,
     message_too_large,
     broken,
-    generation_changed,
     protocol_mismatch,
-    participant_limit,
-    participant_expired,
-    recovery_in_progress,
-    stale_delivery,
-    duplicate_message,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(channel_status status) noexcept {
@@ -64,20 +58,8 @@ enum class channel_status {
         return "message_too_large";
     case channel_status::broken:
         return "broken";
-    case channel_status::generation_changed:
-        return "generation_changed";
     case channel_status::protocol_mismatch:
         return "protocol_mismatch";
-    case channel_status::participant_limit:
-        return "participant_limit";
-    case channel_status::participant_expired:
-        return "participant_expired";
-    case channel_status::recovery_in_progress:
-        return "recovery_in_progress";
-    case channel_status::stale_delivery:
-        return "stale_delivery";
-    case channel_status::duplicate_message:
-        return "duplicate_message";
     }
     return "unknown";
 }

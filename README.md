@@ -1,173 +1,206 @@
 # shmchan
 
-`shmchan` 是一个面向 Linux 的 C++20 共享内存有界 Channel。API 类似 Go channel，底层使用
-`shm_open`、`mmap`、原子操作与 futex，适用于同机多进程/多线程之间传递定长和不定长消息。
+`shmchan` 是一个面向 Linux 的现代 C++20 共享内存 Channel 库。它使用
+`shm_open + mmap + atomic + futex + process-shared robust mutex`，为同一台机器上的进程提供
+类似 Go channel 的 `send/receive` 接口。
 
-项目提供两种故障模型：基础 Channel 追求紧凑和低延迟；`managed_byte_channel` 增加控制面与 robust
-恢复协议，用于需要识别进程崩溃、ACK 重投和 generation fencing 的场景。
+当前简化后的库版本为 1.0.0；旧版实验性的 managed Channel 共享内存布局与 API 不兼容，升级前
+需要停止旧进程并删除旧共享内存对象。
 
-主要能力：
+它是本机、非持久化 IPC：消息是否另外写入数据库、文件或 WAL，完全由业务决定。
 
-- 固定容量 MPMC（多生产者、多消费者）队列
-- 按实际消息长度计费的 MPMC 字节环形缓冲区
-- 阻塞 `send` / `receive`
-- 非阻塞 `try_send` / `try_receive`
-- 带超时的 `send_for` / `receive_for`
-- Go 风格关闭语义：关闭后拒绝新发送，接收端排空缓冲区后得到 `closed`
-- 生产增强的不定长 Channel：参与者心跳、generation、broken/rebuild、ACK/NACK 和超时重投
-- 应用协议 ID/version 校验、运行指标和参与者快照
-- 发送 reservation 与 loaned receive 零拷贝接口
-- 创建、打开和显式 `shm_unlink` 生命周期管理
-- header-only，无第三方依赖
+## 主要能力
 
-| API | 数据布局 | 进程异常后的行为 | 适合场景 |
+- 多生产者、多消费者（MPMC）。
+- 支持不同长度的字节消息，每条消息不超过创建时指定的最大长度。
+- 阻塞、非阻塞和带超时的 `send/receive`。
+- 生产者完整写入后消息才变成可见状态。
+- 消费者完整复制到进程私有内存后，消息槽位才会释放。
+- 进程死在共享内存操作中时，由下一位访问者自动进行槽位级恢复。
+- 不需要 supervisor、generation 重建、ACK、心跳线程或用户恢复代码。
+- 协议 ID/version 校验、运行指标和 `open_or_create()`。
+- 仅依赖 Linux/POSIX 与 C++20 标准库。
+
+## Channel 类型
+
+| 类型 | 消息 | 并发实现 | 进程中途崩溃恢复 |
 |---|---|---|---|
-| `channel<T>` | 固定类型槽位 | 由外部删除并重建 | POD、极简低延迟 |
-| `byte_channel` / `serialized_channel` | 紧凑字节环 | 由外部删除并重建 | 大小差异明显的不定长对象 |
-| `managed_byte_channel` | 固定最大负载槽位 + 控制面 | 自动检测 broken，监督者切换 generation | 需要 ACK、重投和可审计恢复的本机 IPC |
+| `channel<T>` | 固定大小、trivially-copyable 类型 | 有界 MPMC ring | 不保证 |
+| `byte_channel` | 紧凑的不定长字节记录 | 有界字节 ring | 不保证 |
+| `managed_byte_channel` | 每槽位固定上限、实际长度可变 | robust mutex + futex | 自动槽位级恢复 |
+| `serialized_channel<T, Codec>` | 编解码后的对象 | 基于 `byte_channel` | 不保证 |
+
+如果参与进程可能被 `SIGKILL`，并且其他进程必须继续使用同一个 Channel，应选择
+`managed_byte_channel`。
 
 ## 快速开始
 
-```cpp
-#include <shmchan/channel.hpp>
+### 创建或打开
 
-#include <cstdint>
-
-struct event {
-    std::uint64_t id;
-    double value;
-};
-
-// 进程 A：创建并发送
-auto tx = shmchan::channel<event>::create("events", 1024);
-tx.send(event{.id = 1, .value = 3.14});
-tx.close();
-
-// 进程 B：打开并接收
-auto rx = shmchan::channel<event>::open("events");
-for (;;) {
-    auto result = rx.receive();
-    if (result.code == shmchan::channel_status::closed) {
-        break;
-    }
-    use(*result);
-}
-rx.unlink();
-```
-
-名称可以写成 `events` 或 `/events`；库会规范化为 POSIX 共享内存名称 `/events`。容量在创建时固定。
-
-## 不定长对象
-
-不要把 `std::string` 或 `std::vector` 对象的内存表示直接放进共享内存，因为其中包含的堆指针只在
-当前进程有效。`byte_channel` 传输对象序列化后的字节，接收端得到当前进程拥有的
-`std::vector<std::byte>`：
+所有进程都可以调用 `open_or_create()`，不需要单独编写初始化进程：
 
 ```cpp
-#include <shmchan/byte_channel.hpp>
+#include <shmchan/shmchan.hpp>
 
-// 进程 A：参数是整个消息环形区的字节容量，不是消息条数。
-auto tx = shmchan::byte_channel::create("blobs", 1024 * 1024);
-tx.send(std::string_view{"a variable-length message"});
-tx.close();
-
-// 进程 B
-auto rx = shmchan::byte_channel::open("blobs");
-auto result = rx.receive();
-if (result) {
-    consume_bytes(*result);
-}
-```
-
-字符串可以直接使用 `string_channel`，API 仍然是 `send/receive`：
-
-```cpp
-#include <shmchan/serialized_channel.hpp>
-
-auto tx = shmchan::string_channel::create("strings", 1024 * 1024);
-tx.send("short");
-tx.send(std::string(100'000, 'x'));
-tx.close();
-
-auto rx = shmchan::string_channel::open("strings");
-while (auto message = rx.receive()) {
-    use(*message); // std::string
-}
-```
-
-自定义对象通过 codec 接入。编码结果必须是元素宽度为 1 的连续字节范围，解码结果必须拥有自己的数据：
-
-```cpp
-struct document {
-    std::uint64_t id;
-    std::string body;
-};
-
-struct document_codec {
-    std::vector<std::byte> encode(const document&) const;
-    document decode(std::span<const std::byte>) const;
-};
-
-using document_channel =
-    shmchan::serialized_channel<document, document_codec>;
-
-auto channel = document_channel::create("documents", 4 * 1024 * 1024);
-channel.send(document{.id = 7, .body = "variable"});
-```
-
-库校验 `byte_channel` 的共享内存布局，但不会理解应用层 wire format；打开同一名称的所有进程必须使用
-兼容的 codec 和协议版本。解码失败时该条消息已经从 Channel 消费，应由应用决定重试、死信或重建策略。
-
-`capacity_bytes()` 返回按 32 字节向上对齐后的实际环形容量；单条消息最大为
-`max_message_size()`。记录只占用“32 字节元数据 + 实际负载”向上对齐后的空间，负载可以跨环尾存储，
-因此不需要为每个槽预留最大消息长度。
-
-## 带崩溃恢复的不定长 Channel
-
-`managed_byte_channel` 传输不定长字节消息，并要求消费者显式 ACK：
-
-```cpp
-#include <shmchan/managed_channel.hpp>
-
-// 初始化一次；句柄退出后，共享内存对象和已提交消息仍然存在。
 shmchan::managed_channel_options options;
 options.message_capacity = 1024;
 options.max_message_size = 64 * 1024;
-auto tx = shmchan::managed_byte_channel::create("orders", options);
-tx.send("order-42", 42); // 第二个参数是稳定的应用 message_id
+options.protocol = {
+    shmchan::protocol_id("example.orders"),
+    1,
+};
 
-// 另一个进程
-auto rx = shmchan::managed_byte_channel::open("orders");
-auto delivery = rx.receive();
-if (delivery) {
-    handle(delivery->bytes());
-    delivery->ack();
-}
+auto channel =
+    shmchan::managed_byte_channel::open_or_create("orders", options);
 ```
 
-未 ACK 消息在租约超时后会再次投递，因此消费者必须幂等。进程死亡或半完成预留会把当前 generation 标记为
-`broken`；监督者创建全新的 generation，并从应用自己的 durable outbox/WAL 重放消息：
+如果需要严格区分初始化者和使用者，也可以分别使用：
 
 ```cpp
-if (channel.state() == shmchan::managed_channel_state::broken) {
-    channel.rebuild_with_replay([&](auto& rebuilt, auto, auto) {
-        for (const auto& message : durable_outbox.pending()) {
-            if (rebuilt.send(message.bytes, message.id) != shmchan::channel_status::success) {
-                throw std::runtime_error("replay failed");
-            }
-        }
-    });
+auto owner = shmchan::managed_byte_channel::create("orders", options);
+
+shmchan::managed_open_options open_options;
+open_options.protocol = options.protocol;
+auto peer = shmchan::managed_byte_channel::open("orders", open_options);
+```
+
+### 生产者
+
+```cpp
+using namespace std::chrono_literals;
+
+const auto status = channel.send_for(
+    R"({"order_id":42})",
+    1s);
+
+if (status != shmchan::channel_status::success) {
+    // 处理 timed_out、closed、message_too_large 等状态。
 }
 ```
 
-回调执行期间状态为 `replaying`：只允许该回调使用的重建句柄发送，消费者可以持续接收并 ACK，其他生产者
-得到 `recovery_in_progress`。因此大于 Channel 容量的重放需要有消费者同时排空；回调必须检查每次发送
-结果，失败时抛出异常。
+### 消费者
 
-完整的槽位、generation、ACK、重建、零拷贝和生产边界见
-[managed_byte_channel 架构与故障语义](docs/managed-channel.md)。
+```cpp
+auto result = channel.receive_for(1s);
 
-## 构建与测试
+if (result) {
+    std::span<const std::byte> bytes{result->data(), result->size()};
+    handle(bytes);
+}
+```
+
+`receive()` 返回成功时，完整消息已经复制到当前进程的 `std::vector<std::byte>` 中，共享内存槽位已经
+释放，不需要再调用 `ack()`。
+
+### 关闭和删除
+
+```cpp
+channel.close();
+```
+
+`close()` 是整个 Channel 的全局关闭：拒绝新消息，但消费者仍可排空已经发布的消息。对象析构只会解除
+当前进程的映射，不会自动关闭或删除 Channel。
+
+完全删除共享内存对象：
+
+```cpp
+shmchan::managed_byte_channel::unlink("orders");
+```
+
+## 崩溃恢复语义
+
+消息槽位只有三个状态：
+
+```text
+FREE ── send 开始 ──> WRITING ── 完整复制 ──> READY
+ ▲                                                │
+ └──────── receive 完整复制到本地内存 ────────────┘
+```
+
+### 生产者被杀
+
+`send()` 在持有进程共享 robust mutex 时完成整条消息复制，并在最后发布 `READY`：
+
+- 死在发布前：槽位停在 `WRITING`，消费者看不到；下一位访问者自动将它恢复为 `FREE`。
+- 死在发布后：槽位已经是完整的 `READY`，消息继续保留并可正常接收。
+- 死在 Channel 操作之外：对 Channel 没有影响。
+
+### 消费者被杀
+
+`receive()` 在复制期间让槽位保持 `READY`：
+
+- 死在复制中：消息没有删除，下一位消费者仍能完整接收。
+- 完整复制后：槽位才切换为 `FREE`。
+
+这是一种与普通 Go channel 接近的“接收即取走”语义，不是消息队列 ACK 语义。如果消费者已经完整取走
+消息，随后在业务处理前崩溃，该消息不会重新投递。要求业务处理确认、重投或持久化时，应由业务另外实现，
+或者选择专门的消息队列。
+
+### 不需要全局重建
+
+普通进程崩溃不会让整个 Channel `broken`，也不会清空其他 `READY` 消息。下一位获取 robust mutex 的
+生产者或消费者会自动执行恢复，然后继续通信。
+
+只有检测到无法解释的共享内存布局、非法槽位状态，或者 robust mutex 已经不可恢复时，Channel 才进入
+`broken`。这种情况表示内存结构本身损坏，应由运维停止相关进程、`unlink()` 后重新创建，而不是在运行中
+猜测和修补数据。
+
+## “不定长”如何存储
+
+创建时指定：
+
+```cpp
+options.message_capacity = 1024;
+options.max_message_size = 64 * 1024;
+```
+
+每个槽位都预留 `max_message_size` 字节，但通过 `payload_size` 记录实际长度。因此消息可以是 0～64 KiB
+中的任意长度。共享内存占用大致为：
+
+```text
+header + capacity × (64 字节描述符 + max_message_size 按 64 字节对齐)
+```
+
+这种布局没有跨进程堆分配和碎片问题，但当最大消息很大、平均消息很小时会浪费 `/dev/shm` 空间。
+
+不能直接发送包含进程私有指针的对象，例如 `std::string` 或 `std::vector` 的内存布局；应先将对象编码成
+字节，例如 Protobuf、FlatBuffers、JSON 或自定义格式。
+
+## 并发和性能边界
+
+`managed_byte_channel` 使用一个 process-shared robust mutex 串行化槽位选择和消息复制。这带来清晰的
+崩溃边界：进程死在操作中时，内核会让下一位访问者得到 owner-death 通知并自动修复。
+
+代价是多个生产者和消费者的共享内存复制不会完全并行。业务处理发生在 `receive()` 返回之后，不持锁，
+因此通常较慢的业务计算仍可以并发执行。
+
+适合：
+
+- 本机多个 worker 之间的低延迟任务或数据分发。
+- 消息大小和 Channel 容量有明确上限。
+- 要求进程被杀后保留已发布消息并继续通信。
+- 接受“接收成功即从 Channel 删除”的 IPC 语义。
+
+不适合：
+
+- 跨机器通信。
+- 机器重启后恢复消息。
+- exactly-once、ACK 重投或永久去重。
+- 单条消息非常大、复制必须高度并行的场景。
+
+## 状态码
+
+| 状态 | 含义 |
+|---|---|
+| `success` | 操作成功 |
+| `closed` | Channel 已关闭；消费者排空后结束 |
+| `would_block` | 非阻塞操作当前无法完成 |
+| `timed_out` | 带超时操作到期 |
+| `message_too_large` | 消息超过 `max_message_size` |
+| `protocol_mismatch` | 打开端协议 ID/version 不一致 |
+| `broken` | 共享内存结构或 robust mutex 已不可安全使用 |
+
+## 构建和测试
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -175,110 +208,23 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-演示程序可以分两次运行（共享内存中的消息会保留到消费端打开）：
+运行示例：
 
 ```bash
-./build/shmchan_demo produce my-demo
-./build/shmchan_demo consume my-demo
-
-./build/shmchan_variable_demo produce my-variable-demo
-./build/shmchan_variable_demo consume my-variable-demo
+./build/shmchan_managed_demo init my-channel
+./build/shmchan_managed_demo send my-channel hello 1001
+./build/shmchan_managed_demo recv my-channel
+./build/shmchan_managed_demo status my-channel
+./build/shmchan_managed_demo cleanup my-channel
 ```
 
-生产增强示例使用多个命令模拟不同进程：
+## 平台要求
 
-```bash
-./build/shmchan_managed_demo init my-managed-demo
-./build/shmchan_managed_demo send my-managed-demo 'hello shm' 1001
-./build/shmchan_managed_demo status my-managed-demo
-./build/shmchan_managed_demo recv my-managed-demo
-```
-
-故障恢复演示：
-
-```bash
-./build/shmchan_managed_demo break my-managed-demo
-./build/shmchan_managed_demo rebuild my-managed-demo
-./build/shmchan_managed_demo close my-managed-demo
-./build/shmchan_managed_demo cleanup my-managed-demo
-```
-
-`rebuild` 会创建空的新 generation；示例程序没有 durable outbox，所以不会恢复旧 generation 的负载。
-
-安装后使用：
-
-```cmake
-find_package(shmchan CONFIG REQUIRED)
-target_link_libraries(your_target PRIVATE shmchan::shmchan)
-```
-
-## API 状态
-
-所有操作使用 `shmchan::channel_status`：
-
-| 状态 | 含义 |
-|---|---|
-| `success` | 操作成功 |
-| `closed` | Channel 已关闭，且接收端已无可读数据 |
-| `would_block` | `try_*` 当前无法立即完成 |
-| `timed_out` | `*_for` 在时限内未完成 |
-| `message_too_large` | 不定长消息超过该 Channel 的单条消息上限 |
-| `broken` | managed Channel 当前 generation 已判定不可继续使用 |
-| `generation_changed` | 操作属于已经被替换的旧 generation |
-| `protocol_mismatch` | 应用协议 ID/version 不一致 |
-| `participant_limit` | 参与者槽位已满 |
-| `participant_expired` | 当前句柄的槽位已被 fencing |
-| `recovery_in_progress` | 正在重放，仅恢复所有者可发送；消费者仍可接收 |
-| `stale_delivery` | reservation/delivery 已完成、失效或不再对应当前槽位 |
-| `duplicate_message` | 当前 generation 已存在同 ID 的未完成消息 |
-
-`receive` 系列返回 `receive_result<T>`，成功时其中的 `value` 有值，也可以用 `if (result)`、
-`*result` 和 `result->field`。
-
-Channel 句柄可移动、不可复制。销毁句柄只会解除当前进程的映射，不会自动关闭 Channel，也不会删除
-共享内存名称：
-
-- `close()` 是进程间可见、幂等的逻辑关闭；第一次调用返回 `true`。
-- 基础 Channel 的 `unlink()` 删除名称后，已打开映射仍可工作到句柄释放；managed Channel 会先进入
-  `destroying` 并 fencing 所有存量句柄，再删除控制面和已知 generation。
-- `channel<T>::unlink(name)` 可用于显式清理遗留对象。
-
-## 消息类型约束
-
-对于 `channel<T>`，`T` 必须可平凡复制（`std::is_trivially_copyable_v<T>`）且可复制构造。它适合
-整数、浮点数和只包含定长字段的 POD 风格结构体。不定长对象应使用 `byte_channel` 或
-`serialized_channel<T, Codec>`。
-
-不要通过 `channel<T>` 直接传递以下内容：
-
-- `std::string`、`std::vector` 等拥有堆内存的对象
-- 虚函数对象
-- 原始指针或引用（地址在另一个进程中通常无意义）
-- 需要构造/析构资源的类型
-
-打开端会校验元素大小、对齐、类型指纹和库布局。所有进程应使用相同的消息定义、架构、编译工具链和
-`shmchan` 版本。
-
-## 实现说明与边界
-
-容量大于 1 时，队列使用逐槽 sequence 的有界 MPMC 环形算法；容量为 1 时使用专门的原子槽状态机。
-生产/消费快路径不进入内核，仅在队列满或空时通过两个 32 位 epoch futex 休眠和唤醒。热原子与槽按
-64 字节缓存行对齐，以减少伪共享。
-
-`byte_channel` 使用三个单调位置分别完成记录预留、消费者领取和按序回收。生产者发布可以并行，消费者
-复制也可以并行；只有已经领取的前序记录完成后，其空间才会重新交给生产者，避免慢消费者的数据被覆盖。
-按序回收扫描由一个极短的进程共享门保护，无竞争时只执行原子操作，竞争时通过 futex 等待。
-
-这里使用的是 Linux 主流架构上的进程间 lock-free 原子实践；C++ 标准本身没有完整规定把
-`std::atomic` 放进 POSIX 共享映射后的跨进程语义，因此库在编译期要求 32/64 位原子始终无锁。
-
-基础 `channel<T>` 和 `byte_channel` 与多数无锁共享内存环形队列一样，不提供槽位级进程崩溃恢复：如果
-某进程在占用一个槽之后、发布或释放该槽之前被强制终止，应由外部整体删除并重建。
-
-`managed_byte_channel` 实现了监督、generation 切换和 ACK 重投，但仍然是非持久化的本机 IPC。它采用
-保守策略：任何无法证明安全的半完成操作都会令整代 broken，而不是原地修补；旧消息依靠应用的持久
-outbox/WAL 重放。它提供 at-least-once，不提供 exactly-once，也不能在机器重启后替代磁盘消息系统。
+- Linux
+- C++20 编译器
+- 支持 process-shared robust pthread mutex
+- `/dev/shm` 有足够容量
 
 ## 许可证
 
-本项目基于 [MIT License](LICENSE) 开源。
+[MIT License](LICENSE)

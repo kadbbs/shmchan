@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
     shmchan
-    VERSION 0.3.0
+    VERSION 1.0.0
     DESCRIPTION "A low-latency C++20 shared-memory channel for Linux"
     LANGUAGES CXX)
 
