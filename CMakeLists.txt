@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
     shmchan
-    VERSION 0.2.0
+    VERSION 0.3.0
     DESCRIPTION "A low-latency C++20 shared-memory channel for Linux"
     LANGUAGES CXX)
 
@@ -11,6 +11,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 include(GNUInstallDirs)
+find_package(Threads REQUIRED)
 
 add_library(shmchan INTERFACE)
 add_library(shmchan::shmchan ALIAS shmchan)
@@ -21,7 +22,7 @@ target_include_directories(
     INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(shmchan INTERFACE rt)
+target_link_libraries(shmchan INTERFACE rt Threads::Threads)
 
 option(SHMCHAN_BUILD_EXAMPLES "Build shmchan examples" ${PROJECT_IS_TOP_LEVEL})
 
@@ -31,11 +32,13 @@ if(SHMCHAN_BUILD_EXAMPLES)
 
     add_executable(shmchan_variable_demo examples/variable_demo.cpp)
     target_link_libraries(shmchan_variable_demo PRIVATE shmchan::shmchan)
+
+    add_executable(shmchan_managed_demo examples/managed_demo.cpp)
+    target_link_libraries(shmchan_managed_demo PRIVATE shmchan::shmchan)
 endif()
 
 include(CTest)
 if(BUILD_TESTING)
-    find_package(Threads REQUIRED)
     add_executable(shmchan_tests tests/channel_tests.cpp)
     target_link_libraries(shmchan_tests PRIVATE shmchan::shmchan Threads::Threads)
     target_compile_options(shmchan_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
@@ -48,6 +51,13 @@ if(BUILD_TESTING)
         shmchan_variable_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
     add_test(NAME shmchan_variable_tests COMMAND shmchan_variable_tests)
     set_tests_properties(shmchan_variable_tests PROPERTIES TIMEOUT 30)
+
+    add_executable(shmchan_managed_tests tests/managed_channel_tests.cpp)
+    target_link_libraries(shmchan_managed_tests PRIVATE shmchan::shmchan)
+    target_compile_options(
+        shmchan_managed_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+    add_test(NAME shmchan_managed_tests COMMAND shmchan_managed_tests)
+    set_tests_properties(shmchan_managed_tests PROPERTIES TIMEOUT 60)
 endif()
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
@@ -75,3 +85,6 @@ install(
         "${CMAKE_CURRENT_BINARY_DIR}/shmchanConfig.cmake"
         "${CMAKE_CURRENT_BINARY_DIR}/shmchanConfigVersion.cmake"
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shmchan)
+install(
+    FILES LICENSE README.md docs/managed-channel.md
+    DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/shmchan)
