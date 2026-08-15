@@ -309,8 +309,7 @@ void test_killed_incomplete_producer_is_recovered_in_place() {
     (void)::close(ready_pipe[0]);
     check_child_killed(child, SIGKILL);
 
-    // The next normal operation repairs the abandoned WRITING slot. No generation
-    // switch and no supervisor are involved.
+    // The next normal operation repairs the abandoned WRITING slot in place.
     CHECK(channel.send("published-after-crash") ==
           shmchan::channel_status::success);
     CHECK(channel.state() == shmchan::managed_channel_state::healthy);

@@ -270,7 +270,6 @@ struct managed_mapping {
     managed_message_slot* slots{};
     std::byte* payloads{};
     std::string base_name{};
-    std::string object_name{};
 
     ~managed_mapping() {
         if (address != nullptr) {
@@ -462,7 +461,6 @@ public:
     managed_mutex_guard& operator=(const managed_mutex_guard&) = delete;
 
     [[nodiscard]] channel_status status() const noexcept { return status_; }
-    [[nodiscard]] bool owns_lock() const noexcept { return owns_; }
 
     void unlock() noexcept {
         if (owns_) {
@@ -485,12 +483,11 @@ private:
                : poll_deadline;
 }
 
-[[nodiscard]] inline std::shared_ptr<managed_mapping> finish_managed_mapping(
+[[nodiscard]] inline std::unique_ptr<managed_mapping> finish_managed_mapping(
     mapped_region& region,
     std::size_t mapping_size,
-    std::string base_name,
-    std::string object_name) {
-    auto result = std::make_shared<managed_mapping>();
+    std::string base_name) {
+    auto result = std::make_unique<managed_mapping>();
     result->address = region.release();
     result->size = mapping_size;
     result->header = static_cast<managed_shared_header*>(result->address);
@@ -499,11 +496,10 @@ private:
     result->payloads =
         static_cast<std::byte*>(result->address) + result->header->payload_offset;
     result->base_name = std::move(base_name);
-    result->object_name = std::move(object_name);
     return result;
 }
 
-[[nodiscard]] inline std::shared_ptr<managed_mapping> initialize_managed_mapping_locked(
+[[nodiscard]] inline std::unique_ptr<managed_mapping> initialize_managed_mapping_locked(
     int fd,
     std::string base_name,
     std::string object_name,
@@ -594,8 +590,7 @@ private:
         std::memory_order_release);
     header->initialization.store(
         managed_initialization_ready, std::memory_order_release);
-    return finish_managed_mapping(
-        region, layout.mapping_size, std::move(base_name), std::move(object_name));
+    return finish_managed_mapping(region, layout.mapping_size, std::move(base_name));
 }
 
 inline void validate_managed_mapping(
@@ -642,7 +637,7 @@ inline void validate_managed_mapping(
     }
 }
 
-[[nodiscard]] inline std::shared_ptr<managed_mapping> map_managed_fd_locked(
+[[nodiscard]] inline std::unique_ptr<managed_mapping> map_managed_fd_locked(
     int fd,
     std::string base_name,
     std::string object_name,
@@ -672,11 +667,10 @@ inline void validate_managed_mapping(
     mapped_region region(address, mapping_size);
     auto* header = static_cast<managed_shared_header*>(address);
     validate_managed_mapping(*header, mapping_size, object_name, protocol);
-    return finish_managed_mapping(
-        region, mapping_size, std::move(base_name), std::move(object_name));
+    return finish_managed_mapping(region, mapping_size, std::move(base_name));
 }
 
-[[nodiscard]] inline std::shared_ptr<managed_mapping> create_managed_mapping(
+[[nodiscard]] inline std::unique_ptr<managed_mapping> create_managed_mapping(
     std::string_view name,
     const managed_channel_options& options) {
     auto base_name = normalize_name(name);
@@ -705,7 +699,7 @@ inline void validate_managed_mapping(
     }
 }
 
-[[nodiscard]] inline std::shared_ptr<managed_mapping> open_managed_mapping(
+[[nodiscard]] inline std::unique_ptr<managed_mapping> open_managed_mapping(
     std::string_view name,
     protocol_descriptor protocol) {
     auto base_name = normalize_name(name);
@@ -722,7 +716,7 @@ inline void validate_managed_mapping(
     return result;
 }
 
-[[nodiscard]] inline std::shared_ptr<managed_mapping> open_or_create_managed_mapping(
+[[nodiscard]] inline std::unique_ptr<managed_mapping> open_or_create_managed_mapping(
     std::string_view name,
     const managed_channel_options& options) {
     auto base_name = normalize_name(name);
@@ -740,7 +734,7 @@ inline void validate_managed_mapping(
         throw_errno("fstat(open_or_create managed channel)", object_name);
     }
 
-    std::shared_ptr<managed_mapping> result;
+    std::unique_ptr<managed_mapping> result;
     bool needs_initialization = attributes.st_size == 0;
     if (!needs_initialization &&
         static_cast<std::uintmax_t>(attributes.st_size) >= sizeof(managed_shared_header)) {
@@ -1028,7 +1022,7 @@ public:
 
 private:
     explicit managed_byte_channel(
-        std::shared_ptr<detail::managed_mapping> mapping) noexcept
+        std::unique_ptr<detail::managed_mapping> mapping) noexcept
         : mapping_(std::move(mapping)) {}
 
     void require_valid() const {
@@ -1269,7 +1263,7 @@ private:
         }
     }
 
-    std::shared_ptr<detail::managed_mapping> mapping_{};
+    std::unique_ptr<detail::managed_mapping> mapping_{};
 };
 
 } // namespace shmchan

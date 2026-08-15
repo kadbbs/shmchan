@@ -45,6 +45,10 @@ int main(int argc, char** argv) {
     const std::string_view name = argv[2];
     try {
         if (command == "init") {
+            if (argc != 3) {
+                print_usage(argv[0]);
+                return 2;
+            }
             shmchan::managed_channel_options options;
             options.message_capacity = 1024;
             options.max_message_size = 64 * 1024;
@@ -56,6 +60,10 @@ int main(int argc, char** argv) {
         }
 
         if (command == "cleanup") {
+            if (argc != 3) {
+                print_usage(argv[0]);
+                return 2;
+            }
             const bool removed = shmchan::managed_byte_channel::unlink(name);
             std::cout << (removed ? "已删除共享内存对象" : "共享内存对象不存在") << '\n';
             return 0;
@@ -63,7 +71,7 @@ int main(int argc, char** argv) {
 
         auto channel = shmchan::managed_byte_channel::open(name);
         if (command == "send") {
-            if (argc < 4) {
+            if (argc != 4) {
                 print_usage(argv[0]);
                 return 2;
             }
@@ -72,6 +80,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (command == "recv") {
+            if (argc != 3) {
+                print_usage(argv[0]);
+                return 2;
+            }
             auto message = channel.receive_for(5s);
             if (!message) {
                 std::cout << "接收结束: " << shmchan::to_string(message.code) << '\n';
@@ -84,6 +96,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (command == "status") {
+            if (argc != 3) {
+                print_usage(argv[0]);
+                return 2;
+            }
             const auto stats = channel.stats();
             std::cout << "state=" << shmchan::to_string(stats.state)
                       << " reason=" << shmchan::to_string(stats.reason)
@@ -98,6 +114,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (command == "close") {
+            if (argc != 3) {
+                print_usage(argv[0]);
+                return 2;
+            }
             std::cout << (channel.close() ? "已关闭" : "状态未改变") << '\n';
             return 0;
         }

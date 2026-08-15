@@ -4,9 +4,6 @@
 `shm_open + mmap + atomic + futex + process-shared robust mutex`，为同一台机器上的进程提供
 类似 Go channel 的 `send/receive` 接口。
 
-当前简化后的库版本为 1.0.0；旧版实验性的 managed Channel 共享内存布局与 API 不兼容，升级前
-需要停止旧进程并删除旧共享内存对象。
-
 它是本机、非持久化 IPC：消息是否另外写入数据库、文件或 WAL，完全由业务决定。
 
 ## 主要能力
@@ -17,7 +14,6 @@
 - 生产者完整写入后消息才变成可见状态。
 - 消费者完整复制到进程私有内存后，消息槽位才会释放。
 - 进程死在共享内存操作中时，由下一位访问者自动进行槽位级恢复。
-- 不需要 supervisor、generation 重建、ACK、心跳线程或用户恢复代码。
 - 协议 ID/version 校验、运行指标和 `open_or_create()`。
 - 仅依赖 Linux/POSIX 与 C++20 标准库。
 
@@ -90,7 +86,7 @@ if (result) {
 ```
 
 `receive()` 返回成功时，完整消息已经复制到当前进程的 `std::vector<std::byte>` 中，共享内存槽位已经
-释放，不需要再调用 `ack()`。
+释放。
 
 ### 关闭和删除
 
@@ -132,9 +128,8 @@ FREE ── send 开始 ──> WRITING ── 完整复制 ──> READY
 - 死在复制中：消息没有删除，下一位消费者仍能完整接收。
 - 完整复制后：槽位才切换为 `FREE`。
 
-这是一种与普通 Go channel 接近的“接收即取走”语义，不是消息队列 ACK 语义。如果消费者已经完整取走
-消息，随后在业务处理前崩溃，该消息不会重新投递。要求业务处理确认、重投或持久化时，应由业务另外实现，
-或者选择专门的消息队列。
+这是一种与普通 Go channel 接近的“接收即取走”语义。如果消费者已经完整取走消息，随后在业务处理前
+崩溃，该消息不会重新投递。要求业务处理确认、重投或持久化时，应由业务另外实现，或者选择专门的消息队列。
 
 ### 不需要全局重建
 
@@ -185,7 +180,7 @@ header + capacity × (64 字节描述符 + max_message_size 按 64 字节对齐)
 
 - 跨机器通信。
 - 机器重启后恢复消息。
-- exactly-once、ACK 重投或永久去重。
+- exactly-once、业务处理失败后自动重投或永久去重。
 - 单条消息非常大、复制必须高度并行的场景。
 
 ## 状态码
@@ -212,7 +207,7 @@ ctest --test-dir build --output-on-failure
 
 ```bash
 ./build/shmchan_managed_demo init my-channel
-./build/shmchan_managed_demo send my-channel hello 1001
+./build/shmchan_managed_demo send my-channel hello
 ./build/shmchan_managed_demo recv my-channel
 ./build/shmchan_managed_demo status my-channel
 ./build/shmchan_managed_demo cleanup my-channel
